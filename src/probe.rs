@@ -459,6 +459,35 @@ fn disable_unused_streams(device: u32, proc: IoProc, scope: u32) -> Result<(), S
     )
 }
 
+struct RegisteredIo {
+    device: u32,
+    proc: Option<IoProc>,
+    state: *mut State,
+}
+
+impl RegisteredIo {
+    fn stop(&mut self) -> Result<Box<State>, String> {
+        let proc = self.proc.take().ok_or("Audio IO was already stopped")?;
+        let state = std::mem::replace(&mut self.state, ptr::null_mut());
+        let stopped = unsafe { AudioDeviceStop(self.device, Some(proc)) };
+        let destroyed = unsafe { AudioDeviceDestroyIOProcID(self.device, Some(proc)) };
+        if stopped != 0 || destroyed != 0 {
+            return Err(format!(
+                "Audio teardown failed (stop {stopped}, destroy {destroyed}); callback state retained for safety"
+            ));
+        }
+        Ok(unsafe { Box::from_raw(state) })
+    }
+}
+
+impl Drop for RegisteredIo {
+    fn drop(&mut self) {
+        if self.proc.is_some() {
+            let _ = self.stop();
+        }
+    }
+}
+
 fn run(
     device: u32,
     state: Box<State>,
@@ -481,20 +510,18 @@ fn run(
             "Core Audio returned no IOProc token; callback state retained for safety".into(),
         );
     };
+    let mut io = RegisteredIo {
+        device,
+        proc,
+        state: pointer,
+    };
     let setup = disable_unused_streams(device, proc_id, unused_scope)
         .and_then(|()| status(unsafe { AudioDeviceStart(device, proc) }, "start audio IO"));
     if let Err(error) = setup {
-        let stopped = unsafe { AudioDeviceStop(device, proc) };
-        let destroyed = unsafe { AudioDeviceDestroyIOProcID(device, proc) };
-        if stopped == 0 && destroyed == 0 {
-            unsafe {
-                drop(Box::from_raw(pointer));
-            }
-            return Err(error);
-        }
-        return Err(format!(
-            "{error}; cleanup failed (stop {stopped}, destroy {destroyed}); callback state retained"
-        ));
+        return match io.stop() {
+            Ok(_) => Err(error),
+            Err(cleanup) => Err(format!("{error}; {cleanup}")),
+        };
     }
 
     let state = unsafe { &*pointer };
@@ -538,14 +565,7 @@ fn run(
         }
         thread::sleep(Duration::from_millis(10));
     }
-    let stopped = unsafe { AudioDeviceStop(device, proc) };
-    let destroyed = unsafe { AudioDeviceDestroyIOProcID(device, proc) };
-    if stopped != 0 || destroyed != 0 {
-        return Err(format!(
-            "Audio teardown failed (stop {stopped}, destroy {destroyed}); callback state retained for safety"
-        ));
-    }
-    let state = unsafe { Box::from_raw(pointer) };
+    let state = io.stop()?;
     if state.failure.load(Ordering::Acquire) != 0 {
         return Err("Audio callback layout changed or an output buffer was unavailable".into());
     }
