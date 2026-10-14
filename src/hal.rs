@@ -578,8 +578,10 @@ fn owner_pid(uid: &str) -> Option<i32> {
     Some(parsed_pid)
 }
 
+pub const PERSISTENT_UID: &str = "com.github.Byron.odaud.persist";
+
 pub fn is_owned_uid(uid: &str) -> bool {
-    owner_pid(uid).is_some()
+    uid == PERSISTENT_UID || owner_pid(uid).is_some()
 }
 
 fn require_exited_owner(pid: i32) -> Result<(), String> {
@@ -625,23 +627,30 @@ fn wait_until_unpublished(uid: &str) -> Result<(), String> {
     }
 }
 
-/// Remove exactly one ODAUD aggregate only after its encoded owner is proven absent.
-pub fn cleanup_orphan(uid: &str) -> Result<(), String> {
-    let pid = owner_pid(uid).ok_or("cleanup requires an exact ODAUD run/probe UID with a positive PID and nanosecond timestamp")?;
-    require_exited_owner(pid)?;
+/// Remove exactly the persistent ODAUD aggregate or one whose encoded owner is absent.
+pub fn cleanup(uid: &str) -> Result<(), String> {
+    if !is_owned_uid(uid) {
+        return Err("cleanup requires the exact persistent ODAUD UID or a run/probe UID with a positive PID and nanosecond timestamp".into());
+    }
+    let pid = owner_pid(uid);
+    if let Some(pid) = pid {
+        require_exited_owner(pid)?;
+    }
     let Some(id) = published_id_for_uid(uid)? else {
         return Ok(());
     };
     if read_u32(id, fourcc(b"clas"), GLOBAL)? != fourcc(b"aagg") {
         return Err("refusing cleanup: matching UID is not an aggregate device".into());
     }
-    require_exited_owner(pid)?;
+    if let Some(pid) = pid {
+        require_exited_owner(pid)?;
+    }
     if string_property(id, fourcc(b"uid "))? != uid {
         return Err("refusing cleanup: audio object identity changed".into());
     }
     status(
         unsafe { AudioHardwareDestroyAggregateDevice(id) },
-        "destroy orphaned aggregate",
+        "destroy ODAUD aggregate",
     )?;
     wait_until_unpublished(uid)
 }
@@ -943,6 +952,11 @@ impl Aggregate {
         Ok(())
     }
 
+    /// Leave the public Core Audio device alive while releasing our Rust management state.
+    pub fn persist(mut self) {
+        self.id = 0;
+    }
+
     pub fn destroy(&mut self) -> Result<(), String> {
         if self.id == 0 {
             return Ok(());
@@ -1081,14 +1095,30 @@ mod tests {
             "com.github.Byron.odaud.run.1.340282366920938463463374607431768211456",
         ] {
             assert!(!is_owned_uid(uid), "accepted {uid}");
-            assert!(cleanup_orphan(uid).is_err(), "cleanup accepted {uid}");
+            assert!(cleanup(uid).is_err(), "cleanup accepted {uid}");
         }
     }
 
     #[test]
     fn a_live_owner_cannot_be_cleaned_up() {
         let uid = format!("com.github.Byron.odaud.run.{}.1", std::process::id());
-        assert!(cleanup_orphan(&uid).unwrap_err().contains("still alive"));
+        assert!(cleanup(&uid).unwrap_err().contains("still alive"));
+    }
+
+    #[test]
+    fn only_the_exact_persistent_uid_is_owned_without_a_pid() {
+        assert!(is_owned_uid(PERSISTENT_UID));
+        assert_eq!(owner_pid(PERSISTENT_UID), None);
+        for uid in [
+            "com.github.Byron.odaud.persistent",
+            "com.github.Byron.odaud.persist.",
+            "com.github.Byron.odaud.persist.1.2",
+            "com.github.Byron.odaud.persist\0",
+            "other.com.github.Byron.odaud.persist",
+        ] {
+            assert!(!is_owned_uid(uid), "accepted {uid}");
+            assert!(cleanup(uid).is_err(), "cleanup accepted {uid}");
+        }
     }
 
     #[test]

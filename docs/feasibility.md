@@ -16,6 +16,12 @@ callback, and this project does not claim that a hardware aggregate provides
 arbitrary interception. Its diagnostic Rust callback generates its own test
 source.
 
+The later `persist CONFIG.toml` command explicitly keeps the same public
+aggregate after the creating process exits. It uses one stable persistent UID;
+`--force` replaces that device and `cleanup` removes it. No ODAUD process remains
+to monitor hardware or apply configuration changes. This mode is separate from
+the managed lifetime of `run` and `test`.
+
 The implementation calls `AudioHardwareCreateAggregateDevice` with public
 visibility and physical subdevices. ODAUD configures native drift compensation
 and `kAudioSubDeviceExtraOutputLatencyKey` (`latency-out`) in each subdevice's
@@ -58,6 +64,8 @@ elevation, privileged helper, reboot, or separately installed service was used.
 | USB disconnection | Physical Bose unplug stopped ODAUD and removed its aggregate. The Bose was visible after reconnection, and the release build successfully restarted. |
 | Release build | Startup and a 25 ms reload passed native composition readback. A name change was rejected during reload. SIGTERM removed the device, and a separate enumeration confirmed no ODAUD devices remained. |
 | Configuration chirp command | `test examples/bose.toml --seconds 5` sent 240,000 frames through the stereo aggregate and removed it automatically. A second test accepted a 50 ms SIGHUP edit and stopped cleanly on SIGINT after joining its playback worker. |
+| Persistent device after exit | `persist` exited successfully. Separate enumeration and inspection found the public stereo device at 48 kHz with the requested 2,400-frame built-in offset. A separate chirp client then submitted 144,000 frames through it. This check did not include a new acoustic measurement or listening confirmation. |
+| Persistent replacement and removal | A repeat without `--force` failed; invalid delays and an unavailable output with `--force` left the existing device intact. Valid replacement changed the name and built-in offset to 3,600 frames. Explicit cleanup removed the device; default and system-default output IDs stayed 73 throughout. Core Audio reused the numeric device ID across recreation. |
 
 The installed SDK's prose for `kAudioAggregateDeviceIsStackedKey` describes
 zero as mirrored output. That description did not match the observed channel
@@ -78,7 +86,9 @@ A public runtime aggregate can be selected by a separate audio client and
 mirror its stereo source to these two physical outputs. Native per-output
 latency controls audibly change relative timing in the expected direction and
 can be reset without replacing the device. The app explicitly destroys the
-aggregate on a clean stop.
+aggregate on a clean stop in `run` and `test`. `persist` intentionally releases
+its Rust management state without destroying the public aggregate. Retention
+after process exit was tested; reboot, logout, and audio-server restart were not.
 
 The test establishes direction and a noticeable relative shift, **not a
 measured 500 ms shift**. Delay requests are rounded to sample frames. Reported
@@ -139,7 +149,7 @@ Outstanding hardware validation:
 - Recheck visibility, stream composition, and cleanup on other macOS versions
   before claiming support for them.
 
-All 28 automated tests pass, along with Clippy with warnings denied and the
+All 30 automated tests pass, along with Clippy with warnings denied and the
 locked release build. Tests cover the implementation's own parsing, bounds,
 configuration transitions, control inputs, and diagnostic buffer handling.
 Compilation and those tests do not complete the outstanding hardware checks.

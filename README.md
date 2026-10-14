@@ -3,6 +3,7 @@
 ODAUD creates one selectable macOS stereo output that mirrors audio to physical
 outputs with independently configurable relative delays. It runs in the
 foreground, reads TOML configuration, and removes its output on a clean stop.
+Alternatively, `persist` creates the output and leaves it available after exiting.
 The current interface is a Rust CLI; a GUI is deferred.
 
 The agreed implementation uses Core Audio's native aggregate engine for
@@ -39,6 +40,34 @@ in the foreground.
 Choose **ODAUD** in your application's output selector or the macOS sound
 controls. Changing the system default there is your explicit action. Press
 Ctrl-C in the running terminal to stop. SIGTERM also requests a clean stop.
+
+## Keep the device after exiting
+
+```sh
+./target/release/odaud persist examples/bose.toml
+./target/release/odaud persist examples/bose.toml --force
+./target/release/odaud cleanup com.github.Byron.odaud.persist
+```
+
+`persist` validates the configuration, creates the same mirrored output as
+`run`, and exits without removing it. Core Audio continues to provide playback,
+delays, and drift compensation; no ODAUD process or extra service stays running.
+Select the device explicitly in macOS or your player.
+
+There is **one persistent ODAUD device**, identified by the stable UID
+`com.github.Byron.odaud.persist`, regardless of configuration path or device
+name. If it already exists, `persist` fails unless `--force` is supplied.
+`--force` validates the new configuration and connected outputs, removes the
+existing device, and recreates it. Replacement interrupts playback and may
+require selecting the device again. If recreation fails, the old device is
+already gone. Temporary devices from `run` and `test` are separate.
+
+Use `persist --force` to apply configuration edits; there is no file reload or
+ODAUD monitoring of disconnection, sleep, or sample-rate changes after exit.
+Offsets remain in frames at the rate used during creation, so reapply the
+configuration after changing sample rates. Run persistence and cleanup commands
+sequentially. `cleanup` removes the persistent device explicitly.
+Survival across reboot, logout, or an audio-server restart is unverified.
 
 ## Listen to the configuration
 
@@ -103,7 +132,7 @@ restart. Invalid reloads are reported; the previous accepted configuration
 remains in use. A failed native update stops the device, because a partially
 applied Core Audio change cannot safely be treated as the previous configuration.
 
-The application stops and removes the aggregate when it detects output loss,
+For `run` and `test`, the application stops and removes the aggregate when it detects output loss,
 a sample-rate change, or system sleep. Run it again after fixing the device
 configuration or waking. Physical Bose unplug/reconnect and a subsequent
 restart were tested. Actual sleep/wake and sample-rate-change checks remain pending.
@@ -136,8 +165,9 @@ safety-offset, buffer, and clock information.
 
 **SIGKILL leaves the public aggregate behind on the tested macOS version.**
 No process cleanup can run after that signal. Use its exact ODAUD UID with
-`cleanup`; cleanup refuses a device whose owning process is still alive.
-Normal shutdown was verified to remove the device from a separate process's
+`cleanup`; cleanup refuses a temporary device whose owning process is still alive.
+The exact persistent UID can be cleaned up without an owning process.
+Normal shutdown of `run` and `test` was verified to remove the device from a separate process's
 enumeration. Because ODAUD never changes defaults, it has no application-owned
 default change to restore; macOS handles any fallback from a disappearing
 device selected by the user.

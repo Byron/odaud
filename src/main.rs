@@ -30,10 +30,10 @@ extern "C" fn on_signal(number: i32) {
 #[derive(Parser)]
 #[command(
     version,
-    about = "Temporary macOS stereo output with native delay compensation"
+    about = "On-demand macOS stereo output with native delay compensation"
 )]
 #[command(
-    after_help = "SIGHUP reloads delays; Ctrl-C stops and removes the device. System defaults are never changed."
+    after_help = "For run/test, SIGHUP reloads delays and Ctrl-C removes the device. Persist keeps it after exit. System defaults are never changed."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -54,6 +54,13 @@ enum Command {
     Check { config: PathBuf },
     /// Run the configured output until Ctrl-C; select it in macOS or your player
     Run { config: PathBuf },
+    /// Create a persistent output and exit; select it in macOS or your player
+    Persist {
+        config: PathBuf,
+        /// Recreate the existing persistent ODAUD device, interrupting its playback
+        #[arg(long)]
+        force: bool,
+    },
     /// Play quiet chirps through the configured outputs and delays, then stop
     #[command(
         after_help = "SIGHUP reloads delay edits while chirps play. No manual output selection is needed."
@@ -64,7 +71,7 @@ enum Command {
         #[arg(long, default_value = "30", value_parser = test_seconds)]
         seconds: f64,
     },
-    /// Remove an exact orphaned ODAUD UID whose owner has exited
+    /// Remove a persistent ODAUD device or an orphan whose owner has exited
     Cleanup { uid: String },
     /// Experiment with native aggregate settings
     ProbeNative(NativeArgs),
@@ -182,7 +189,11 @@ fn run(command: Command) -> Result<(), String> {
                     "{:?}\tuid={:?}\tid={}\toutputs={}\tinputs={}\trate={}",
                     d.name, d.uid, d.id, d.output_channels, d.input_channels, d.sample_rate
                 );
-                if hal::is_owned_uid(&d.uid) {
+                if d.uid == hal::PERSISTENT_UID {
+                    println!(
+                        "  Persistent ODAUD device; remove with cleanup or replace with persist --force"
+                    );
+                } else if hal::is_owned_uid(&d.uid) {
                     println!(
                         "  ODAUD-owned UID; cleanup requires its owner process to have exited"
                     );
@@ -203,10 +214,11 @@ fn run(command: Command) -> Result<(), String> {
             print_outputs(&config, rate);
         }
         Command::Run { config } => configured(&config, None)?,
+        Command::Persist { config, force } => persist(&config, force)?,
         Command::Test { config, seconds } => configured(&config, Some(seconds))?,
         Command::Cleanup { uid } => {
-            hal::cleanup_orphan(&uid)?;
-            println!("removed orphan {uid:?}");
+            hal::cleanup(&uid)?;
+            println!("removed {uid:?}");
         }
         Command::ProbePlay { uid, seconds } => {
             println!("{}", probe::play(find_device(&uid)?.id, seconds)?);
@@ -278,6 +290,67 @@ fn print_outputs(config: &config::Config, rate: f64) {
     }
 }
 
+fn create_configured(
+    config: &config::Config,
+    selected: &[hal::Device],
+    rate: f64,
+    uid: &str,
+) -> Result<hal::Aggregate, String> {
+    let aggregate = hal::Aggregate::create(
+        &config.name,
+        uid,
+        &native_offsets(config, rate),
+        &selected[0].uid,
+        true,
+        false,
+    )?;
+    let device = find_device(uid)?;
+    if device.output_channels != 2 || device.sample_rate != rate {
+        return Err(
+            "Core Audio did not create the expected stereo output at the configured rate".into(),
+        );
+    }
+    Ok(aggregate)
+}
+
+fn persist(path: &Path, force: bool) -> Result<(), String> {
+    let config = config::Config::load(path)?;
+    // Validate before replacing a working persistent device.
+    let (selected, rate) = selected_outputs(&config)?;
+    if STOP.load(Ordering::Relaxed) {
+        return Err("persist interrupted".into());
+    }
+    if hal::devices()?.iter().any(|d| d.uid == hal::PERSISTENT_UID) {
+        if !force {
+            return Err(
+                "persistent ODAUD device already exists; use --force to recreate it".into(),
+            );
+        }
+        hal::cleanup(hal::PERSISTENT_UID)?;
+    }
+    let aggregate = create_configured(&config, &selected, rate, hal::PERSISTENT_UID)?;
+    if STOP.load(Ordering::Relaxed) {
+        return Err("persist interrupted".into());
+    }
+    println!(
+        "persisted: {:?}; uid={:?}; stereo {rate} Hz",
+        config.name,
+        hal::PERSISTENT_UID
+    );
+    println!(
+        "clock reference: {:?}; native drift compensation enabled for other outputs",
+        selected[0].name
+    );
+    print_outputs(&config, rate);
+    println!(
+        "The device stays available after exit. Apply edits with persist --force; remove with cleanup {:?}.",
+        hal::PERSISTENT_UID
+    );
+    std::io::stdout().flush().map_err(|e| e.to_string())?;
+    aggregate.persist();
+    Ok(())
+}
+
 fn configured(path: &Path, test_duration: Option<f64>) -> Result<(), String> {
     let mut config = config::Config::load(path)?;
     if let Some(duration) = test_duration {
@@ -303,20 +376,7 @@ fn configured(path: &Path, test_duration: Option<f64>) -> Result<(), String> {
             .map_err(|e| e.to_string())?
             .as_nanos()
     );
-    let mut aggregate = hal::Aggregate::create(
-        &config.name,
-        &uid,
-        &native_offsets(&config, rate),
-        &selected[0].uid,
-        true,
-        false,
-    )?;
-    let aggregate_device = find_device(&uid)?;
-    if aggregate_device.output_channels != 2 || aggregate_device.sample_rate != rate {
-        return Err(
-            "Core Audio did not create the expected stereo output at the configured rate".into(),
-        );
-    }
+    let mut aggregate = create_configured(&config, &selected, rate, &uid)?;
     println!(
         "running: {:?}; pid={}; uid={uid:?}; stereo {rate} Hz",
         config.name,
@@ -537,6 +597,30 @@ mod tests {
                 .kind(),
             clap::error::ErrorKind::DisplayVersion
         );
+    }
+
+    #[test]
+    fn cli_parses_persist_and_requires_explicit_force() {
+        for (args, expected_force) in [
+            (vec!["odaud", "persist", "room.toml"], false),
+            (vec!["odaud", "persist", "--force", "room.toml"], true),
+            (vec!["odaud", "persist", "room.toml", "--force"], true),
+        ] {
+            let Command::Persist { config, force } = Cli::try_parse_from(args).unwrap().command
+            else {
+                panic!("wrong command")
+            };
+            assert_eq!(config, Path::new("room.toml"));
+            assert_eq!(force, expected_force);
+        }
+        for args in [
+            vec!["odaud", "persist"],
+            vec!["odaud", "persist", "--force"],
+            vec!["odaud", "persist", "room.toml", "--typo"],
+            vec!["odaud", "run", "room.toml", "--force"],
+        ] {
+            assert!(Cli::try_parse_from(args).is_err());
+        }
     }
 
     #[test]
