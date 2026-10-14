@@ -1,0 +1,11 @@
+name = "ODAUD"
+
+[[outputs]]
+uid = "BuiltInSpeakerDevice"
+enabled = true
+delay_ms = 0
+
+[[outputs]]
+uid = "AppleUSBAudioEngine:Actions:Bose SoundLink Home USB:ACTIONS-DEV-SN0:2"
+enabled = true
+delay_ms = 0

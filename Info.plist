@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>CFBundleIdentifier</key><string>com.github.Byron.odaud</string>
+  <key>CFBundleName</key><string>ODAUD</string>
+  <key>CFBundleVersion</key><string>1</string>
+  <key>NSAudioCaptureUsageDescription</key><string>ODAUD tests whether selected output audio can be processed and delayed.</string>
+  <key>NSMicrophoneUsageDescription</key><string>ODAUD measures synthetic test sounds to verify speaker timing.</string>
+</dict></plist>
