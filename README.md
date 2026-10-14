@@ -40,6 +40,24 @@ Choose **ODAUD** in your application's output selector or the macOS sound
 controls. Changing the system default there is your explicit action. Press
 Ctrl-C in the running terminal to stop. SIGTERM also requests a clean stop.
 
+## Listen to the configuration
+
+```sh
+./target/release/odaud test examples/bose.toml
+./target/release/odaud test examples/bose.toml --seconds 120
+```
+
+`test` creates the configured device and emits a quiet 20 ms chirp each second
+through all enabled outputs, including their configured delays. It needs no
+manual output selection and never changes the system default. It stops after
+30 seconds by default and removes the device; Ctrl-C stops it early.
+
+While listening, edit the delays and send SIGHUP to the printed PID to hear
+the changes. The same configuration validation and shutdown handling as
+`run` apply. Choose a duration at least one second longer than the largest
+configured delay. Use `odaud test --help` or `odaud --help` for generated CLI
+help.
+
 ## Configuration
 
 ```toml
@@ -92,8 +110,8 @@ restart were tested. Actual sleep/wake and sample-rate-change checks remain pend
 
 ## Align the speakers
 
-1. Start with both delays at zero. Play a quiet, repeating click or short
-   percussive sound through ODAUD and listen from your usual position.
+1. Start with both delays at zero. Run `odaud test CONFIG.toml --seconds 120`
+   and listen from your usual position.
 2. Identify the earlier speaker. Increase **that output's** `delay_ms` in the
    TOML file, then send SIGHUP to the printed process ID.
 3. Adjust in small steps until the two attacks sound as close as possible.

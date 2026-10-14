@@ -1,4 +1,4 @@
-//! Deliberately separate source/capture processes for acoustic feasibility tests.
+//! Quiet test playback and bounded diagnostic capture.
 
 use std::{
     cell::UnsafeCell,
@@ -622,6 +622,50 @@ pub fn play(device: u32, seconds: f64) -> Result<String, String> {
     ))
 }
 
+/// Declare after the owned aggregate so unwinding joins playback before removing the device.
+pub struct ChirpPlayback {
+    worker: Option<thread::JoinHandle<Result<String, String>>>,
+}
+
+impl ChirpPlayback {
+    pub fn start(device: u32, seconds: f64) -> Result<Self, String> {
+        let worker = thread::Builder::new()
+            .name("odaud-test-playback".into())
+            .spawn(move || play(device, seconds))
+            .map_err(|error| format!("Start test playback worker: {error}"))?;
+        Ok(Self {
+            worker: Some(worker),
+        })
+    }
+
+    pub fn is_finished(&self) -> bool {
+        self.worker
+            .as_ref()
+            .is_none_or(thread::JoinHandle::is_finished)
+    }
+
+    pub fn finish(mut self) -> Result<String, String> {
+        self.stop_and_join()
+    }
+
+    fn stop_and_join(&mut self) -> Result<String, String> {
+        crate::STOP.store(true, Ordering::Relaxed);
+        self.worker
+            .take()
+            .ok_or("Test playback was already joined")?
+            .join()
+            .map_err(|_| "Test playback worker panicked".to_string())?
+    }
+}
+
+impl Drop for ChirpPlayback {
+    fn drop(&mut self) {
+        if self.worker.is_some() {
+            let _ = self.stop_and_join();
+        }
+    }
+}
+
 /// Capture at most 60 seconds for acoustic measurement; never overwrite a file.
 pub fn capture(device: u32, seconds: f64, path: &Path) -> Result<String, String> {
     let layout = Layout::inspect(device, INPUT)?;
@@ -876,5 +920,44 @@ mod tests {
         assert_eq!(u32::from_le_bytes(wav[4..8].try_into().unwrap()), 44);
         assert_eq!(u32::from_le_bytes(wav[40..44].try_into().unwrap()), 8);
         assert_eq!(&wav[44..], &[0, 0, 255, 127, 1, 128, 0, 0]);
+    }
+
+    #[test]
+    fn playback_guard_joins_on_finish_and_unwind_and_reports_worker_panic() {
+        use std::sync::{Arc, atomic::AtomicBool};
+
+        crate::STOP.store(false, Ordering::Relaxed);
+        let finished = ChirpPlayback {
+            worker: Some(thread::spawn(|| Ok("finished".into()))),
+        };
+        assert_eq!(finished.finish().unwrap(), "finished");
+
+        crate::STOP.store(false, Ordering::Relaxed);
+        let joined = Arc::new(AtomicBool::new(false));
+        let worker_joined = Arc::clone(&joined);
+        let unwound = std::panic::catch_unwind(move || {
+            let _playback = ChirpPlayback {
+                worker: Some(thread::spawn(move || {
+                    let deadline = Instant::now() + Duration::from_secs(1);
+                    while !crate::STOP.load(Ordering::Relaxed) && Instant::now() < deadline {
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                    worker_joined.store(crate::STOP.load(Ordering::Relaxed), Ordering::Release);
+                    Ok("stopped".into())
+                })),
+            };
+            panic!("simulated control-thread panic");
+        });
+        assert!(unwound.is_err());
+        assert!(
+            joined.load(Ordering::Acquire),
+            "playback must stop and join while unwinding"
+        );
+
+        let failed = ChirpPlayback {
+            worker: Some(thread::spawn(|| panic!("simulated playback worker panic"))),
+        };
+        assert!(failed.finish().unwrap_err().contains("panicked"));
+        crate::STOP.store(false, Ordering::Relaxed);
     }
 }

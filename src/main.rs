@@ -54,6 +54,16 @@ enum Command {
     Check { config: PathBuf },
     /// Run the configured output until Ctrl-C; select it in macOS or your player
     Run { config: PathBuf },
+    /// Play quiet chirps through the configured outputs and delays, then stop
+    #[command(
+        after_help = "SIGHUP reloads delay edits while chirps play. No manual output selection is needed."
+    )]
+    Test {
+        config: PathBuf,
+        /// Test duration in seconds (1–7200); Ctrl-C stops early
+        #[arg(long, default_value = "30", value_parser = test_seconds)]
+        seconds: f64,
+    },
     /// Remove an exact orphaned ODAUD UID whose owner has exited
     Cleanup { uid: String },
     /// Experiment with native aggregate settings
@@ -115,6 +125,14 @@ fn seconds(text: &str) -> Result<f64, String> {
     let value = text.parse::<f64>().map_err(|_| "invalid duration")?;
     if !value.is_finite() || !(0.1..=7200.0).contains(&value) {
         return Err("duration must be between 0.1 and 7200 seconds".into());
+    }
+    Ok(value)
+}
+
+fn test_seconds(text: &str) -> Result<f64, String> {
+    let value = seconds(text)?;
+    if value < 1.0 {
+        return Err("chirp tests must last at least one second".into());
     }
     Ok(value)
 }
@@ -184,7 +202,8 @@ fn run(command: Command) -> Result<(), String> {
             );
             print_outputs(&config, rate);
         }
-        Command::Run { config } => configured(&config)?,
+        Command::Run { config } => configured(&config, None)?,
+        Command::Test { config, seconds } => configured(&config, Some(seconds))?,
         Command::Cleanup { uid } => {
             hal::cleanup_orphan(&uid)?;
             println!("removed orphan {uid:?}");
@@ -259,8 +278,20 @@ fn print_outputs(config: &config::Config, rate: f64) {
     }
 }
 
-fn configured(path: &Path) -> Result<(), String> {
+fn configured(path: &Path, test_duration: Option<f64>) -> Result<(), String> {
     let mut config = config::Config::load(path)?;
+    if let Some(duration) = test_duration {
+        let max_delay = config
+            .enabled()
+            .map(|output| output.delay_ms)
+            .fold(0.0, f64::max);
+        if duration < max_delay / 1000.0 + 1.0 {
+            return Err(
+                "test duration must exceed the largest configured delay by at least one second"
+                    .into(),
+            );
+        }
+    }
     let (selected, rate) = selected_outputs(&config)?;
     // Keep the power watcher alive until the aggregate is gone before acknowledging sleep.
     let mut power = power::PowerWatch::new()?;
@@ -296,13 +327,28 @@ fn configured(path: &Path) -> Result<(), String> {
         selected[0].name
     );
     print_outputs(&config, rate);
-    println!(
-        "Select this device explicitly in macOS or your player. SIGHUP reloads delays; Ctrl-C stops."
-    );
+    if let Some(duration) = test_duration {
+        println!(
+            "Playing quiet chirps for {duration} seconds through the configured delays. SIGHUP reloads delays; Ctrl-C stops early."
+        );
+    } else {
+        println!(
+            "Select this device explicitly in macOS or your player. SIGHUP reloads delays; Ctrl-C stops."
+        );
+    }
     std::io::stdout().flush().map_err(|e| e.to_string())?;
+    let chirps = test_duration
+        .map(|duration| probe::ChirpPlayback::start(aggregate.id, duration))
+        .transpose()?;
     let mut result = Ok(());
     let mut health_at = Instant::now();
     while !STOP.load(Ordering::Relaxed) {
+        if chirps
+            .as_ref()
+            .is_some_and(probe::ChirpPlayback::is_finished)
+        {
+            break;
+        }
         if power.poll() {
             println!("stopping: system sleep requested; run again after waking");
             break;
@@ -359,11 +405,15 @@ fn configured(path: &Path) -> Result<(), String> {
         }
         std::thread::sleep(Duration::from_millis(25));
     }
+    let playback = chirps.map(probe::ChirpPlayback::finish).transpose();
     let cleanup = aggregate.destroy();
     let sleep = power.allow_sleep();
     cleanup?;
     sleep?;
     println!("stopped: removed {uid:?}");
+    if let Some(report) = playback? {
+        println!("{report}");
+    }
     result
 }
 
@@ -474,7 +524,7 @@ mod tests {
     #[test]
     fn cli_has_generated_help_and_version() {
         Cli::command().debug_assert();
-        for args in [vec!["odaud", "--help"], vec!["odaud", "run", "--help"]] {
+        for args in [vec!["odaud", "--help"], vec!["odaud", "test", "--help"]] {
             assert_eq!(
                 Cli::try_parse_from(args).err().unwrap().kind(),
                 clap::error::ErrorKind::DisplayHelp
@@ -490,9 +540,30 @@ mod tests {
     }
 
     #[test]
-    fn cli_rejects_invalid_arguments() {
+    fn cli_parses_chirp_duration_and_rejects_invalid_arguments() {
+        let Command::Test { config, seconds } = Cli::try_parse_from(["odaud", "test", "room.toml"])
+            .unwrap()
+            .command
+        else {
+            panic!("wrong command")
+        };
+        assert_eq!(config, Path::new("room.toml"));
+        assert_eq!(seconds, 30.0);
+        let Command::Test { seconds, .. } =
+            Cli::try_parse_from(["odaud", "test", "room.toml", "--seconds", "45"])
+                .unwrap()
+                .command
+        else {
+            panic!("wrong command")
+        };
+        assert_eq!(seconds, 45.0);
+        for duration in ["0", "0.1", "NaN", "inf", "-1", "7201"] {
+            assert!(
+                Cli::try_parse_from(["odaud", "test", "room.toml", "--seconds", duration]).is_err()
+            );
+        }
         for args in [
-            vec!["odaud", "run"],
+            vec!["odaud", "test"],
             vec!["odaud", "devices", "--typo"],
             vec!["odaud", "check", "one.toml", "extra"],
             vec!["odaud", "probe-capture", "mic", "61", "out.wav"],

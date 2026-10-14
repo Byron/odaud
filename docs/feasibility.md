@@ -57,6 +57,7 @@ elevation, privileged helper, reboot, or separately installed service was used.
 | Configuration reload | An unknown TOML field was rejected without removing the device; a valid 12.5 ms reload became 600 native frames at 48 kHz on the same UID. |
 | USB disconnection | Physical Bose unplug stopped ODAUD and removed its aggregate. The Bose was visible after reconnection, and the release build successfully restarted. |
 | Release build | Startup and a 25 ms reload passed native composition readback. A name change was rejected during reload. SIGTERM removed the device, and a separate enumeration confirmed no ODAUD devices remained. |
+| Configuration chirp command | `test examples/bose.toml --seconds 5` sent 240,000 frames through the stereo aggregate and removed it automatically. A second test accepted a 50 ms SIGHUP edit and stopped cleanly on SIGINT after joining its playback worker. |
 
 The installed SDK's prose for `kAudioAggregateDeviceIsStackedKey` describes
 zero as mirrored output. That description did not match the observed channel
@@ -97,6 +98,11 @@ record exact physical UIDs, formats, current rates, and reported latency data.
 The normal `run examples/bose.toml` command and manual listening procedure are
 described in [the README](../README.md).
 
+For a one-command listening test, use `odaud test examples/bose.toml --seconds 30`.
+It creates the configured aggregate, emits chirps through it in the same process,
+accepts SIGHUP delay edits, and tears down when the timer ends or Ctrl-C is pressed.
+The separate-client probes below remain available for platform experiments.
+
 Experimental commands retained for a developer are:
 
 ```text
@@ -133,7 +139,7 @@ Outstanding hardware validation:
 - Recheck visibility, stream composition, and cleanup on other macOS versions
   before claiming support for them.
 
-All 27 automated tests pass, along with Clippy with warnings denied and the
+All 28 automated tests pass, along with Clippy with warnings denied and the
 locked release build. Tests cover the implementation's own parsing, bounds,
 configuration transitions, control inputs, and diagnostic buffer handling.
 Compilation and those tests do not complete the outstanding hardware checks.
