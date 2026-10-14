@@ -30,12 +30,31 @@ description. Live updates set `kAudioAggregateDevicePropertyComposition`
 and destruction run outside audio callbacks. Normal routing uses no process
 tap, microphone, capture-and-replay loop, or custom resampler.
 
+`test --sound real-audio` explicitly selects the ordinary macOS default output
+through `kAudioHardwarePropertyDefaultOutputDevice` (`dOut`). Another app using
+that default supplies the audio directly to Core Audio. With `--latency-check`,
+the first physical output is selected during the reference/menu stage and the
+aggregate during comparison. Without the interactive flag, the aggregate is
+selected for the test duration. No synthetic source or capture callback runs.
+The separate alert output, `kAudioHardwarePropertyDefaultSystemOutputDevice`
+(`sOut`), is unchanged. Players with explicit device selections do not follow
+these switches; even a default-following player may pause or reopen its output.
+
+The previous default UID is retained and restored before aggregate destruction
+if ODAUD's last selection is still current. A different selection detected by
+250 ms polling or before a routing change stops the test and relinquishes
+ownership. Core Audio exposes no compare-and-set for this property: a manual
+change concurrent with a write can race, and a change away and back between
+checks is not detectable. An unavailable previous device causes a restoration
+error while aggregate teardown still runs. SIGKILL cannot restore the default.
+
 Relevant Apple interfaces:
 
 - [AudioHardwareCreateAggregateDevice](https://developer.apple.com/documentation/coreaudio/audiohardwarecreateaggregatedevice(_:_:))
 - [AudioHardwareDestroyAggregateDevice](https://developer.apple.com/documentation/coreaudio/audiohardwaredestroyaggregatedevice(_:))
 - [AudioHardwareCreateProcessTap](https://developer.apple.com/documentation/coreaudio/audiohardwarecreateprocesstap(_:_:))
 - [CATapDescription](https://developer.apple.com/documentation/coreaudio/catapdescription)
+- [kAudioHardwarePropertyDefaultOutputDevice](https://developer.apple.com/documentation/coreaudio/kaudiohardwarepropertydefaultoutputdevice)
 
 The installed Core Audio SDK documents aggregate destruction as asynchronous.
 It describes extra subdevice latency as sample frames added to or subtracted
@@ -56,7 +75,7 @@ elevation, privileged helper, reboot, or separately installed service was used.
 | Live Bose delay | A SIGHUP update from 0 to a requested 500 ms made built-in speakers sound first and Bose second. Returning to zero restored the previous relative timing. |
 | Live built-in delay | A requested 500 ms on built-in speakers made Bose sound first and built-in speakers second. |
 | Device continuity during delay reload | Reloads retained the aggregate UID and output format. |
-| Default routing | Default and system-default output remained the built-in speakers during the experiment; ODAUD performed no default-output writes. |
+| Initial default routing | Default and system-default output remained the built-in speakers during the original aggregate experiment; that experiment performed no default-output writes. |
 | Clean shutdown | After normal termination, a separate enumerating process no longer found the public device. |
 | Abnormal termination | After SIGKILL, the public aggregate remained. Explicit orphan cleanup is required. |
 | Orphan recovery | Cleanup removed the exact crashed probe UID. Cleanup of a live ODAUD UID was refused. |
@@ -67,6 +86,8 @@ elevation, privileged helper, reboot, or separately installed service was used.
 | Pulse test sound | `test examples/bose.toml --sound pulse --seconds 3` submitted 144,000 frames of the accented four-beat-per-second pattern through the configured aggregate and removed the device automatically. |
 | Inline latency controls | A PTY session on Bose/built-in outputs verified Enter/Esc reference-to-aggregate switching, all four arrow steps, and native readback of 31 ms (1,488 frames) and 10 ms (480 frames) on the same aggregate UID. Core Audio reported the aggregate stopped in reference mode and running in comparison mode. |
 | Interactive save and shutdown | Explicit Save preserved comments; an external file edit caused Save to be refused. SIGHUP reloaded file values. Resize, q, a raw Ctrl-C key, SIGTERM, and a three-second session deadline all restored terminal modes, printed final values, and removed the test device. The deadline did not reset on source switching. User configuration and system defaults were unchanged by the test harness. |
+| Real-audio with a continuing player | An independent `afplay` process played a quiet WAV through the system default. The same player remained active through reference → aggregate → reference switches. Separate HAL queries confirmed aggregate I/O stopped → running → stopped, with physical reference I/O active outside comparison. All four arrow adjustments were accepted during playback: 21, 31, 30, then 20 ms became the expected native frame values on the same aggregate. This verifies routing and live control readback, not acoustic accuracy or gap-free transitions. |
+| Real-audio restoration | q, SIGTERM, and a three-second noninteractive timeout removed the temporary device and restored the previous default. A menu-only session that started with Bose as the default restored Bose after temporarily selecting built-in speakers. An external default change during comparison stopped the session and preserved that choice. PTY raw mode and stdin nonblocking state were restored; final delays were printed. Alert output and user configuration were unchanged, and the harness restored its original default after testing. |
 | Persistent device after exit | `persist` exited successfully. Separate enumeration and inspection found the public stereo device at 48 kHz with the requested 2,400-frame built-in offset. A separate chirp client then submitted 144,000 frames through it. This check did not include a new acoustic measurement or listening confirmation. |
 | Persistent replacement and removal | A repeat without `--force` failed; invalid delays and an unavailable output with `--force` left the existing device intact. Valid replacement changed the name and built-in offset to 3,600 frames. Explicit cleanup removed the device; default and system-default output IDs stayed 73 throughout. Core Audio reused the numeric device ID across recreation. |
 
@@ -116,6 +137,16 @@ It creates the configured aggregate, emits chirps through it in the same process
 accepts SIGHUP delay edits, and tears down when the timer ends or Ctrl-C is pressed.
 The separate-client probes below remain available for platform experiments.
 
+To test with a preferred player, run
+`odaud test examples/bose.toml --sound real-audio --latency-check` and play audio
+in an app that follows the system default. Enter compares the configured outputs;
+Esc returns to the first physical output. Delay adjustment and explicit saving
+use the same controls as the generated sound test. Check the default output
+from another process during each stage and after quitting. Also change the
+default manually during the test to verify that ODAUD stops and preserves it.
+The continuing-player, live-control, and restoration observations are recorded
+above. Other players' behavior on default-output changes remains application-specific.
+
 Experimental commands retained for a developer are:
 
 ```text
@@ -136,6 +167,8 @@ To verify abnormal cleanup, retain the exact printed UID, terminate only the
 known test process, enumerate with `devices --all`, and use `cleanup UID` on
 the orphan. Cleanup is explicit and refuses a live owning process. Never
 infer crash cleanup from a normal destructor running.
+If testing `--sound real-audio`, record the original default first and restore
+it manually after SIGKILL; orphan cleanup does not restore routing.
 
 Outstanding hardware validation:
 
@@ -152,9 +185,11 @@ Outstanding hardware validation:
 - Recheck visibility, stream composition, and cleanup on other macOS versions
   before claiming support for them.
 
-All 43 automated tests pass, along with Clippy with warnings denied and the
+All 46 automated tests pass, along with Clippy with warnings denied and the
 locked release build. Tests cover the implementation's own parsing, bounds,
 configuration transitions, explicit saves, control inputs, and diagnostic buffer handling.
+Default-output ownership tests check UID matching and permanent relinquishment
+after observing an external selection; these do not prove native routing.
 A terminal-only PTY regression also sends incomplete escape and UTF-8 input,
 then verifies prompt SIGTERM shutdown and restoration of raw mode and the
 stdin nonblocking flag. No alternate-screen mode is used.

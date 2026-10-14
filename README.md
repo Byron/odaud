@@ -9,8 +9,9 @@ The current interface is a Rust CLI; a GUI is deferred.
 The agreed implementation uses Core Audio's native aggregate engine for
 playback, clock-drift compensation, and delay compensation. ODAUD owns the
 aggregate's creation, configuration, and teardown. It installs no driver,
-privileged helper, launch service, or daemon, and never writes the default
-output settings. Select its output explicitly in macOS or your player.
+privileged helper, launch service, or daemon. Select its output explicitly in
+macOS or your player. Only `test --sound real-audio` temporarily changes the
+default output, so you can test with audio from another app.
 
 On macOS 27.0.1, Bose SoundLink Home USB and built-in MacBook speakers at 48 kHz
 played a separate client's stereo signal together. Listening confirmed the
@@ -76,12 +77,13 @@ Survival across reboot, logout, or an audio-server restart is unverified.
 ./target/release/odaud test examples/bose.toml --seconds 120
 ./target/release/odaud test examples/bose.toml --sound pulse --seconds 120
 ./target/release/odaud test examples/bose.toml --latency-check
+./target/release/odaud test examples/bose.toml --sound real-audio --latency-check
 ```
 
 `test` creates the configured device and emits a quiet 20 ms chirp each second
 through all enabled outputs, including their configured delays. It needs no
-manual output selection and never changes the system default. It stops after
-30 seconds by default and removes the device; Ctrl-C stops it early.
+manual output selection. Generated sounds do not change the system default.
+It stops after 30 seconds by default and removes the device; Ctrl-C stops it early.
 
 `--sound pulse` plays a steady four-beat-per-second pattern instead of chirps.
 Each beat is a quiet 60 ms tone, with a higher accent each second and a distinct
@@ -95,12 +97,35 @@ the changes. The same configuration validation and shutdown handling as
 configured delay. Use `odaud test --help` or `odaud --help` for generated CLI
 help.
 
+### Use audio from another app
+
+`--sound real-audio` selects the test device as the macOS default output;
+play music, speech, or any other sound in your preferred player. ODAUD generates
+no sound and does not capture or replay the player's audio. The player must use
+the system default output; an app pinned to a specific device will not follow
+the changes. Playback keeps the player's volume, without the quiet level limit
+of the generated sounds. The separate macOS output for alerts is unchanged.
+
+With `--latency-check`, the default output is the first enabled physical output
+while choosing a device. Enter switches it to the aggregate for comparison;
+Esc switches it back to the reference. A player may pause, reopen its output,
+or introduce a gap when the default changes. Without `--latency-check`, audio
+uses the aggregate for the test duration, which defaults to 30 seconds.
+
+On a clean stop, ODAUD restores the previous default output if its selected
+output is still current. If you select another output yourself, ODAUD stops
+and preserves that selection. It checks every 250 ms and before switching or
+restoring; a change away and back between checks can be missed, and a change
+concurrent with a native routing write can race. The original device is found
+by UID; restoration reports an error if it is no longer available.
+
 ## Adjust delays interactively
 
 `test CONFIG.toml --latency-check` opens inline terminal controls without an
 alternate screen. It defaults to the predictable pulse pattern. Use
-`--sound chirp` to choose chirps instead. The check runs until you quit, with
-a two-hour limit; `--seconds` sets a shorter limit for the whole session.
+`--sound chirp` for chirps or `--sound real-audio` for another app's audio.
+The check runs until you quit, with a two-hour limit; `--seconds` sets a shorter
+limit for the whole session.
 It requires a terminal and at least two enabled outputs in the configuration.
 
 While choosing a device, only the **first enabled physical output** plays the
@@ -117,10 +142,11 @@ all configured outputs. The aggregate stays available throughout the session.
 | q or Ctrl-C | Stop, remove the test device, and print the final values |
 
 Delay changes apply immediately through Core Audio, bounded to 0–5000 ms.
-Switching between reference and comparison stops one source before starting
-the other; it can introduce a brief gap. The displayed delay is the requested
-compensation, not a measurement of total acoustic latency. Listen from your
-usual position and adjust the earlier output until the attacks sound together.
+For generated sounds, switching between reference and comparison stops one
+source before starting the other; it can introduce a brief gap. The displayed
+delay is the requested compensation, not a measurement of total acoustic
+latency. Listen from your usual position and adjust the earlier output until
+the attacks sound together.
 
 Changes stay in memory until you press **s**, which works in either mode.
 Saving preserves comments, other configuration fields, and file permissions.
@@ -209,13 +235,15 @@ other Core Audio devices. `inspect` reports formats and available latency,
 safety-offset, buffer, and clock information.
 
 **SIGKILL leaves the public aggregate behind on the tested macOS version.**
-No process cleanup can run after that signal. Use its exact ODAUD UID with
+No process cleanup can run after that signal. In `--sound real-audio` mode,
+the default output may also remain changed; select your preferred output
+manually. Use the orphan's exact ODAUD UID with
 `cleanup`; cleanup refuses a temporary device whose owning process is still alive.
 The exact persistent UID can be cleaned up without an owning process.
 Normal shutdown of `run` and `test` was verified to remove the device from a separate process's
-enumeration. Because ODAUD never changes defaults, it has no application-owned
-default change to restore; macOS handles any fallback from a disappearing
-device selected by the user.
+enumeration. For `--sound real-audio`, clean shutdown attempts guarded default
+restoration before removing the device. Other modes leave default selection
+to the user; macOS handles fallback from a disappearing selected device.
 
 ## Validation and dependencies
 

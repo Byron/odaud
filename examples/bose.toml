@@ -1,4 +1,4 @@
-name = "ODAUD"
+name = "Cinema"
 
 [[outputs]]
 uid = "BuiltInSpeakerDevice"

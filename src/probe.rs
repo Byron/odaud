@@ -29,6 +29,8 @@ pub enum Sound {
     Chirp,
     /// Repeating accented beats make timing differences audible as doubled hits.
     Pulse,
+    /// Route audio from other apps using the macOS default output; generates no sound.
+    RealAudio,
 }
 
 #[repr(C)]
@@ -651,11 +653,15 @@ fn play_until_stopped(
     sound: Sound,
     stopped: &AtomicBool,
 ) -> Result<String, String> {
+    if sound == Sound::RealAudio {
+        return Err("real-audio uses other applications, not a generated playback source".into());
+    }
     let layout = Layout::inspect(device, OUTPUT)?;
     let target = frame_count(seconds, layout.rate, 86_400.0)?;
     let audio = Audio::Source(match sound {
         Sound::Chirp => chirp_cycle(layout.rate),
         Sound::Pulse => pulse_cycle(layout.rate),
+        Sound::RealAudio => unreachable!(),
     });
     let state = Box::new(State {
         layout,
@@ -668,6 +674,7 @@ fn play_until_stopped(
     let description = match sound {
         Sound::Chirp => "20 ms, 700–2800 Hz chirp every second",
         Sound::Pulse => "four accented 60 ms beats per second (eight-second phrase)",
+        Sound::RealAudio => unreachable!(),
     };
     Ok(format!(
         "Played {} frames at {} Hz to {} channels; {description}, peak at most 0.05 (-26 dBFS)",
@@ -814,6 +821,15 @@ fn write_wav(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn real_audio_never_starts_a_generated_audio_callback() {
+        assert!(
+            play_sound(0, 1.0, Sound::RealAudio)
+                .unwrap_err()
+                .contains("other applications")
+        );
+    }
 
     fn layout(channels: Vec<usize>) -> Layout {
         Layout {

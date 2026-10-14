@@ -34,7 +34,7 @@ extern "C" fn on_signal(number: i32) {
     about = "On-demand macOS stereo output with native delay compensation"
 )]
 #[command(
-    after_help = "For run/test, SIGHUP reloads delays and Ctrl-C removes the device. Persist keeps it after exit. System defaults are never changed."
+    after_help = "For run/test, SIGHUP reloads delays and Ctrl-C removes the device. Persist keeps it after exit. Only test --sound real-audio temporarily changes the default output."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -62,9 +62,9 @@ enum Command {
         #[arg(long)]
         force: bool,
     },
-    /// Play a quiet test sound through the configured outputs and delays, then stop
+    /// Test the configured outputs and delays with a generated sound or other apps' audio
     #[command(
-        after_help = "SIGHUP reloads delay edits while the sound plays. No manual output selection is needed."
+        after_help = "SIGHUP reloads delay edits while the sound plays. No manual output selection is needed. With --sound real-audio, play audio in another app using the system default; the previous default is restored on exit if still owned by ODAUD."
     )]
     Test {
         config: PathBuf,
@@ -95,7 +95,7 @@ struct TestOptions {
     /// Test duration in seconds (1–7200); Ctrl-C stops early
     #[arg(long, default_value = "30", default_value_if("latency_check", "true", "7200"), value_parser = test_seconds)]
     seconds: f64,
-    /// Source sound; pulse provides a steady rhythm for comparing speakers
+    /// Source sound; real-audio temporarily routes the macOS default output
     #[arg(
         long,
         value_enum,
@@ -372,6 +372,7 @@ fn persist(path: &Path, force: bool) -> Result<(), String> {
 fn configured(path: &Path, test: Option<&TestOptions>) -> Result<(), String> {
     let (mut config, mut source) = config::Config::load_with_source(path)?;
     let interactive = test.is_some_and(|test| test.latency_check);
+    let real_audio = test.is_some_and(|test| test.sound == probe::Sound::RealAudio);
     if interactive && (!std::io::stdin().is_terminal() || !std::io::stdout().is_terminal()) {
         return Err("--latency-check requires an interactive terminal for stdin and stdout".into());
     }
@@ -403,6 +404,7 @@ fn configured(path: &Path, test: Option<&TestOptions>) -> Result<(), String> {
                 .as_nanos()
         );
         let mut aggregate = create_configured(&config, &selected, rate, &uid)?;
+        let mut routing = real_audio.then(hal::DefaultOutput::new).transpose()?;
         println!(
             "running: {:?}; pid={}; uid={uid:?}; stereo {rate} Hz",
             config.name,
@@ -414,10 +416,23 @@ fn configured(path: &Path, test: Option<&TestOptions>) -> Result<(), String> {
         );
         print_outputs(&config, rate);
         if let Some(test) = test {
-            println!(
-                "Playing quiet {:?} for at most {} seconds; Ctrl-C stops early.",
-                test.sound, test.seconds
-            );
+            if real_audio {
+                println!(
+                    "Routing other apps' audio for at most {} seconds; Ctrl-C stops early.",
+                    test.seconds
+                );
+                println!(
+                    "Play audio in another app using the system default. Its playback volume is unchanged."
+                );
+                println!(
+                    "The previous default output will be restored on exit. Changing it yourself stops this test."
+                );
+            } else {
+                println!(
+                    "Playing quiet {:?} for at most {} seconds; Ctrl-C stops early.",
+                    test.sound, test.seconds
+                );
+            }
         } else {
             println!(
                 "Select this device explicitly in macOS or your player. SIGHUP reloads delays; Ctrl-C stops."
@@ -430,7 +445,11 @@ fn configured(path: &Path, test: Option<&TestOptions>) -> Result<(), String> {
             ui.draw(&selected, &enabled_delays(&config), &message)?;
         }
         let deadline = test.map(|test| Instant::now() + Duration::from_secs_f64(test.seconds));
+        if let Some(routing) = routing.as_mut() {
+            routing.select(if interactive { &selected[0].uid } else { &uid })?;
+        }
         let mut playback = test
+            .filter(|_| !real_audio)
             .map(|test| {
                 probe::Playback::start(
                     if interactive {
@@ -457,6 +476,9 @@ fn configured(path: &Path, test: Option<&TestOptions>) -> Result<(), String> {
                     break;
                 }
                 if Instant::now() >= health_at {
+                    if let Some(routing) = routing.as_mut() {
+                        routing.check()?;
+                    }
                     let (current, current_rate) = selected_outputs(&config)?;
                     if current_rate != rate
                         || current.iter().zip(&selected).any(|(a, b)| a.id != b.id)
@@ -508,25 +530,33 @@ fn configured(path: &Path, test: Option<&TestOptions>) -> Result<(), String> {
                             latency::Action::Quit => break,
                             latency::Action::Redraw => {}
                             latency::Action::Switch(output) => {
-                                if let Some(previous) = playback.take() {
-                                    previous.finish()?;
-                                }
-                                let remaining = deadline
-                                    .expect("interactive test has a deadline")
-                                    .saturating_duration_since(Instant::now())
-                                    .as_secs_f64();
-                                if remaining * rate < 1.0 {
-                                    break;
-                                }
-                                playback = Some(probe::Playback::start(
-                                    if output.is_some() {
-                                        aggregate.id
+                                if let Some(routing) = routing.as_mut() {
+                                    routing.select(if output.is_some() {
+                                        &uid
                                     } else {
-                                        selected[0].id
-                                    },
-                                    remaining,
-                                    test.expect("interactive test has sound options").sound,
-                                )?);
+                                        &selected[0].uid
+                                    })?;
+                                } else {
+                                    if let Some(previous) = playback.take() {
+                                        previous.finish()?;
+                                    }
+                                    let remaining = deadline
+                                        .expect("interactive test has a deadline")
+                                        .saturating_duration_since(Instant::now())
+                                        .as_secs_f64();
+                                    if remaining * rate < 1.0 {
+                                        break;
+                                    }
+                                    playback = Some(probe::Playback::start(
+                                        if output.is_some() {
+                                            aggregate.id
+                                        } else {
+                                            selected[0].id
+                                        },
+                                        remaining,
+                                        test.expect("interactive test has sound options").sound,
+                                    )?);
+                                }
                                 message = "Changes are in memory until you press s to save.".into();
                             }
                             latency::Action::Adjust { output, delta } => {
@@ -559,10 +589,18 @@ fn configured(path: &Path, test: Option<&TestOptions>) -> Result<(), String> {
         })();
         let played = playback.take().map(probe::Playback::finish).transpose();
         drop(ui);
+        let restored = routing
+            .as_mut()
+            .map(hal::DefaultOutput::restore)
+            .transpose();
+        drop(routing);
         let cleanup = aggregate.destroy();
         let sleep = power.allow_sleep();
         cleanup?;
         sleep?;
+        if restored? == Some(true) {
+            println!("Restored the previous default output.");
+        }
         if sleep_requested {
             println!("stopping: system sleep requested; run again after waking");
         }
@@ -809,6 +847,22 @@ mod tests {
         };
         assert_eq!(options.sound, probe::Sound::Pulse);
         assert!(Cli::try_parse_from(["odaud", "test", "room.toml", "--sound", "oops"]).is_err());
+    }
+
+    #[test]
+    fn real_audio_supports_timed_and_interactive_sessions() {
+        for interactive in [false, true] {
+            let mut args = vec!["odaud", "test", "room.toml", "--sound", "real-audio"];
+            if interactive {
+                args.push("--latency-check");
+            }
+            let Command::Test { options, .. } = Cli::try_parse_from(args).unwrap().command else {
+                panic!("wrong command")
+            };
+            assert_eq!(options.sound, probe::Sound::RealAudio);
+            assert_eq!(options.latency_check, interactive);
+            assert_eq!(options.seconds, if interactive { 7200.0 } else { 30.0 });
+        }
     }
 
     #[test]

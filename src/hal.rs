@@ -610,6 +610,133 @@ fn published_id_for_uid(uid: &str) -> Result<Option<u32>, String> {
     Ok(None)
 }
 
+fn default_output_uid() -> Result<String, String> {
+    string_property(read_u32(SYSTEM, fourcc(b"dOut"), GLOBAL)?, fourcc(b"uid "))
+}
+
+/// Declare after the aggregate so default routing is restored before device destruction.
+pub struct DefaultOutput {
+    previous_uid: String,
+    selected_uid: Option<String>,
+}
+
+impl DefaultOutput {
+    pub fn new() -> Result<Self, String> {
+        let previous_uid = default_output_uid()?;
+        Ok(Self {
+            selected_uid: Some(previous_uid.clone()),
+            previous_uid,
+        })
+    }
+
+    fn still_selected(&mut self, current_uid: &str) -> bool {
+        if self.selected_uid.as_deref() == Some(current_uid) {
+            true
+        } else {
+            self.selected_uid = None;
+            false
+        }
+    }
+
+    pub fn check(&mut self) -> Result<(), String> {
+        if self.still_selected(&default_output_uid()?) {
+            Ok(())
+        } else {
+            Err(
+                "default output changed outside ODAUD; stopping and preserving that selection"
+                    .into(),
+            )
+        }
+    }
+
+    pub fn select(&mut self, uid: &str) -> Result<(), String> {
+        let id = published_id_for_uid(uid)?
+            .ok_or_else(|| format!("default output UID {uid:?} is unavailable"))?;
+        if read_u32(id, fourcc(b"dflt"), OUTPUT)? == 0 {
+            return Err(format!("device {uid:?} cannot be the default output"));
+        }
+        let address = Address {
+            selector: fourcc(b"dOut"),
+            scope: GLOBAL,
+            element: 0,
+        };
+        let mut settable = 0;
+        status(
+            unsafe { AudioObjectIsPropertySettable(SYSTEM, &address, &mut settable) },
+            "query default output support",
+        )?;
+        if settable == 0 {
+            return Err("Core Audio does not permit changing the default output".into());
+        }
+        self.check()?;
+        if self.selected_uid.as_deref() == Some(uid) {
+            return Ok(());
+        }
+        if string_property(id, fourcc(b"uid "))? != uid {
+            return Err("default output identity changed before routing".into());
+        }
+        // shortcut: Core Audio has no compare-and-set; a concurrent change between read/write can race.
+        status(
+            unsafe {
+                AudioObjectSetPropertyData(
+                    SYSTEM,
+                    &address,
+                    0,
+                    ptr::null(),
+                    mem::size_of::<u32>() as u32,
+                    ptr::from_ref(&id).cast(),
+                )
+            },
+            "select default output",
+        )?;
+        let previous = self.selected_uid.replace(uid.to_string());
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let current = default_output_uid()?;
+            if current == uid {
+                return Ok(());
+            }
+            if Some(&current) != previous.as_ref() {
+                self.still_selected(&current);
+                return Err(
+                    "default output changed during routing; preserving that selection".into(),
+                );
+            }
+            if Instant::now() >= deadline {
+                return Err(format!("Core Audio did not confirm default output {uid:?}"));
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    pub fn restore(&mut self) -> Result<bool, String> {
+        if self.selected_uid.is_none() {
+            return Ok(false);
+        }
+        let current = default_output_uid()?;
+        if !self.still_selected(&current) {
+            return Ok(false);
+        }
+        let changed = current != self.previous_uid;
+        let result = if changed {
+            self.select(&self.previous_uid.clone())
+                .map_err(|error| format!("could not restore previous default output: {error}"))
+        } else {
+            Ok(())
+        };
+        self.selected_uid = None;
+        result.map(|()| changed)
+    }
+}
+
+impl Drop for DefaultOutput {
+    fn drop(&mut self) {
+        if let Err(error) = self.restore() {
+            eprintln!("odaud: {error}");
+        }
+    }
+}
+
 fn wait_until_unpublished(uid: &str) -> Result<(), String> {
     let deadline = Instant::now() + Duration::from_secs(3);
     loop {
@@ -995,6 +1122,22 @@ impl Drop for Aggregate {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_output_ownership_is_by_uid_and_external_changes_relinquish_it() {
+        let mut routing = DefaultOutput {
+            previous_uid: "original".into(),
+            selected_uid: Some("reference".into()),
+        };
+        assert!(routing.still_selected("reference"));
+        routing.selected_uid = Some("aggregate".into());
+        assert!(routing.still_selected("aggregate"));
+        assert_eq!(routing.previous_uid, "original");
+        assert!(!routing.still_selected("user-choice"));
+        assert_eq!(routing.selected_uid, None);
+        assert!(!routing.still_selected("aggregate"));
+        assert!(!routing.restore().unwrap());
+    }
 
     #[test]
     fn enumeration_skips_confirmed_disappearance_but_keeps_live_device_errors() {
