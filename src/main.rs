@@ -3,11 +3,12 @@ compile_error!("ODAUD requires macOS");
 
 mod config;
 mod hal;
+mod latency;
 mod power;
 mod probe;
 
 use clap::{Args, Parser, Subcommand};
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -92,11 +93,19 @@ enum Command {
 #[derive(Args)]
 struct TestOptions {
     /// Test duration in seconds (1–7200); Ctrl-C stops early
-    #[arg(long, default_value = "30", value_parser = test_seconds)]
+    #[arg(long, default_value = "30", default_value_if("latency_check", "true", "7200"), value_parser = test_seconds)]
     seconds: f64,
     /// Source sound; pulse provides a steady rhythm for comparing speakers
-    #[arg(long, value_enum, default_value = "chirp")]
+    #[arg(
+        long,
+        value_enum,
+        default_value = "chirp",
+        default_value_if("latency_check", "true", "pulse")
+    )]
     sound: probe::Sound,
+    /// Adjust delays interactively; defaults to pulses and a two-hour time limit
+    #[arg(long)]
+    latency_check: bool,
 }
 
 #[derive(Args)]
@@ -361,127 +370,252 @@ fn persist(path: &Path, force: bool) -> Result<(), String> {
 }
 
 fn configured(path: &Path, test: Option<&TestOptions>) -> Result<(), String> {
-    let mut config = config::Config::load(path)?;
-    if let Some(test) = test {
-        let max_delay = config
-            .enabled()
-            .map(|output| output.delay_ms)
-            .fold(0.0, f64::max);
-        if test.seconds < max_delay / 1000.0 + 1.0 {
-            return Err(
-                "test duration must exceed the largest configured delay by at least one second"
-                    .into(),
+    let (mut config, mut source) = config::Config::load_with_source(path)?;
+    let interactive = test.is_some_and(|test| test.latency_check);
+    if interactive && (!std::io::stdin().is_terminal() || !std::io::stdout().is_terminal()) {
+        return Err("--latency-check requires an interactive terminal for stdin and stdout".into());
+    }
+    let result = (|| {
+        if let Some(test) = test {
+            let max_delay = config
+                .enabled()
+                .map(|output| output.delay_ms)
+                .fold(0.0, f64::max);
+            if test.seconds < max_delay / 1000.0 + 1.0 {
+                return Err(
+                    "test duration must exceed the largest configured delay by at least one second"
+                        .into(),
+                );
+            }
+        }
+        let (selected, rate) = selected_outputs(&config)?;
+        if interactive && selected.len() < 2 {
+            return Err("--latency-check requires at least two enabled outputs".into());
+        }
+        // Keep the power watcher alive until the aggregate is gone before acknowledging sleep.
+        let mut power = power::PowerWatch::new()?;
+        let uid = format!(
+            "com.github.Byron.odaud.run.{}.{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_err(|e| e.to_string())?
+                .as_nanos()
+        );
+        let mut aggregate = create_configured(&config, &selected, rate, &uid)?;
+        println!(
+            "running: {:?}; pid={}; uid={uid:?}; stereo {rate} Hz",
+            config.name,
+            std::process::id()
+        );
+        println!(
+            "clock reference: {:?}; native drift compensation enabled for other outputs",
+            selected[0].name
+        );
+        print_outputs(&config, rate);
+        if let Some(test) = test {
+            println!(
+                "Playing quiet {:?} for at most {} seconds; Ctrl-C stops early.",
+                test.sound, test.seconds
+            );
+        } else {
+            println!(
+                "Select this device explicitly in macOS or your player. SIGHUP reloads delays; Ctrl-C stops."
             );
         }
-    }
-    let (selected, rate) = selected_outputs(&config)?;
-    // Keep the power watcher alive until the aggregate is gone before acknowledging sleep.
-    let mut power = power::PowerWatch::new()?;
-    let uid = format!(
-        "com.github.Byron.odaud.run.{}.{}",
-        std::process::id(),
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(|e| e.to_string())?
-            .as_nanos()
-    );
-    let mut aggregate = create_configured(&config, &selected, rate, &uid)?;
-    println!(
-        "running: {:?}; pid={}; uid={uid:?}; stereo {rate} Hz",
-        config.name,
-        std::process::id()
-    );
-    println!(
-        "clock reference: {:?}; native drift compensation enabled for other outputs",
-        selected[0].name
-    );
-    print_outputs(&config, rate);
-    if let Some(test) = test {
-        println!(
-            "Playing quiet {:?} for {} seconds through the configured delays. SIGHUP reloads delays; Ctrl-C stops early.",
-            test.sound, test.seconds
-        );
-    } else {
-        println!(
-            "Select this device explicitly in macOS or your player. SIGHUP reloads delays; Ctrl-C stops."
-        );
-    }
-    std::io::stdout().flush().map_err(|e| e.to_string())?;
-    let playback = test
-        .map(|test| probe::Playback::start(aggregate.id, test.seconds, test.sound))
-        .transpose()?;
-    let mut result = Ok(());
-    let mut health_at = Instant::now();
-    while !STOP.load(Ordering::Relaxed) {
-        if playback.as_ref().is_some_and(probe::Playback::is_finished) {
-            break;
+        std::io::stdout().flush().map_err(|e| e.to_string())?;
+        let mut ui = interactive.then(latency::Ui::new).transpose()?;
+        let mut message = "Changes are in memory until you press s to save.".to_string();
+        if let Some(ui) = ui.as_mut() {
+            ui.draw(&selected, &enabled_delays(&config), &message)?;
         }
-        if power.poll() {
-            println!("stopping: system sleep requested; run again after waking");
-            break;
-        }
-        if Instant::now() >= health_at {
-            let health = selected_outputs(&config).and_then(|(current, current_rate)| {
-                if current_rate != rate || current.iter().zip(&selected).any(|(a, b)| a.id != b.id)
+        let deadline = test.map(|test| Instant::now() + Duration::from_secs_f64(test.seconds));
+        let mut playback = test
+            .map(|test| {
+                probe::Playback::start(
+                    if interactive {
+                        selected[0].id
+                    } else {
+                        aggregate.id
+                    },
+                    test.seconds,
+                    test.sound,
+                )
+            })
+            .transpose()?;
+        let mut health_at = Instant::now();
+        let mut sleep_requested = false;
+        let running = (|| {
+            while !STOP.load(Ordering::Relaxed) {
+                if deadline.is_some_and(|deadline| Instant::now() >= deadline)
+                    || playback.as_ref().is_some_and(probe::Playback::is_finished)
                 {
-                    return Err(
-                        "an output reconnected or changed sample rate; restart ODAUD".into(),
-                    );
+                    break;
                 }
-                let running = find_device(&uid)?;
-                if running.sample_rate != rate || running.output_channels != 2 {
-                    return Err("the aggregate format changed; restart ODAUD".into());
+                if power.poll() {
+                    sleep_requested = true;
+                    break;
                 }
-                Ok(())
-            });
-            if let Err(error) = health {
-                result = Err(error);
-                break;
-            }
-            health_at = Instant::now() + Duration::from_millis(250);
-        }
-        if RELOAD.swap(false, Ordering::Relaxed) {
-            let update = (|| {
-                let next = config::Config::load(path)?;
-                if !config.same_topology(&next) {
-                    return Err(
-                        "name or enabled outputs changed; stop and restart to apply those changes"
-                            .into(),
-                    );
-                }
-                let (_, current_rate) = selected_outputs(&next)?;
-                if current_rate != rate {
-                    return Err("output sample rate changed; restart required".into());
-                }
-                Ok::<_, String>(next)
-            })();
-            match update {
-                Err(error) => eprintln!("reload rejected: {error}"),
-                Ok(next) => {
-                    if let Err(error) = aggregate.set_latencies(&native_offsets(&next, rate)) {
-                        result = Err(format!(
-                            "native delay update failed; stopping because its state is uncertain: {error}"
-                        ));
-                        break;
+                if Instant::now() >= health_at {
+                    let (current, current_rate) = selected_outputs(&config)?;
+                    if current_rate != rate
+                        || current.iter().zip(&selected).any(|(a, b)| a.id != b.id)
+                    {
+                        return Err(
+                            "an output reconnected or changed sample rate; restart ODAUD".into(),
+                        );
                     }
-                    config = next;
-                    println!("reloaded delays:");
-                    print_outputs(&config, rate);
+                    let device = find_device(&uid)?;
+                    if device.sample_rate != rate || device.output_channels != 2 {
+                        return Err("the aggregate format changed; restart ODAUD".into());
+                    }
+                    health_at = Instant::now() + Duration::from_millis(250);
                 }
+                let mut redraw = false;
+                if RELOAD.swap(false, Ordering::Relaxed) {
+                    let update = (|| {
+                        let (next, text) = config::Config::load_with_source(path)?;
+                        if !config.same_topology(&next) {
+                            return Err("name or enabled outputs changed; stop and restart to apply those changes".into());
+                        }
+                        let (_, current_rate) = selected_outputs(&next)?;
+                        if current_rate != rate {
+                            return Err("output sample rate changed; restart required".into());
+                        }
+                        Ok::<_, String>((next, text))
+                    })();
+                    match update {
+                        Err(error) if ui.is_some() => message = format!("Reload rejected: {error}"),
+                        Err(error) => eprintln!("reload rejected: {error}"),
+                        Ok((next, text)) => {
+                            apply_delays(&mut aggregate, &next, rate)?;
+                            config = next;
+                            source = text;
+                            if ui.is_some() {
+                                message = "Reloaded delays from the configuration file.".into();
+                            } else {
+                                println!("reloaded delays:");
+                                print_outputs(&config, rate);
+                            }
+                        }
+                    }
+                    redraw = true;
+                }
+                if let Some(ui) = ui.as_mut() {
+                    if let Some(action) = ui.poll(selected.len())? {
+                        redraw = true;
+                        match action {
+                            latency::Action::Quit => break,
+                            latency::Action::Redraw => {}
+                            latency::Action::Switch(output) => {
+                                if let Some(previous) = playback.take() {
+                                    previous.finish()?;
+                                }
+                                let remaining = deadline
+                                    .expect("interactive test has a deadline")
+                                    .saturating_duration_since(Instant::now())
+                                    .as_secs_f64();
+                                if remaining * rate < 1.0 {
+                                    break;
+                                }
+                                playback = Some(probe::Playback::start(
+                                    if output.is_some() {
+                                        aggregate.id
+                                    } else {
+                                        selected[0].id
+                                    },
+                                    remaining,
+                                    test.expect("interactive test has sound options").sound,
+                                )?);
+                                message = "Changes are in memory until you press s to save.".into();
+                            }
+                            latency::Action::Adjust { output, delta } => {
+                                let mut next = config.clone();
+                                if adjust_delay(&mut next, output, delta)? {
+                                    apply_delays(&mut aggregate, &next, rate)?;
+                                    config = next;
+                                    message = "Applied live; press s to save.".into();
+                                } else {
+                                    message = "Delay is bounded to 0-5000 ms.".into();
+                                }
+                            }
+                            latency::Action::Save => match config.save_delays(path, &source) {
+                                Ok(text) => {
+                                    source = text;
+                                    message =
+                                        "Saved delay settings to the configuration file.".into();
+                                }
+                                Err(error) => message = format!("Save refused: {error}"),
+                            },
+                        }
+                    }
+                    if redraw {
+                        ui.draw(&selected, &enabled_delays(&config), &message)?;
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(25));
             }
+            Ok::<_, String>(())
+        })();
+        let played = playback.take().map(probe::Playback::finish).transpose();
+        drop(ui);
+        let cleanup = aggregate.destroy();
+        let sleep = power.allow_sleep();
+        cleanup?;
+        sleep?;
+        if sleep_requested {
+            println!("stopping: system sleep requested; run again after waking");
         }
-        std::thread::sleep(Duration::from_millis(25));
-    }
-    let playback = playback.map(probe::Playback::finish).transpose();
-    let cleanup = aggregate.destroy();
-    let sleep = power.allow_sleep();
-    cleanup?;
-    sleep?;
-    println!("stopped: removed {uid:?}");
-    if let Some(report) = playback? {
-        println!("{report}");
+        println!("stopped: removed {uid:?}");
+        running?;
+        if let Some(report) = played? {
+            println!("{report}");
+        }
+        Ok(())
+    })();
+    if interactive {
+        println!("Final delay settings (written to the file only when you press s):");
+        for output in config.enabled() {
+            println!("  uid={:?} delay_ms={:.3}", output.uid, output.delay_ms);
+        }
     }
     result
+}
+
+fn enabled_delays(config: &config::Config) -> Vec<f64> {
+    config.enabled().map(|output| output.delay_ms).collect()
+}
+
+fn adjust_delay(
+    config: &mut config::Config,
+    enabled_index: usize,
+    delta: f64,
+) -> Result<bool, String> {
+    if !delta.is_finite() {
+        return Err("delay adjustment must be finite".into());
+    }
+    let output = config
+        .outputs
+        .iter_mut()
+        .filter(|output| output.enabled)
+        .nth(enabled_index)
+        .ok_or("selected output is unavailable")?;
+    let next = (output.delay_ms + delta).clamp(0.0, 5000.0);
+    let changed = next != output.delay_ms;
+    output.delay_ms = next;
+    Ok(changed)
+}
+
+fn apply_delays(
+    aggregate: &mut hal::Aggregate,
+    config: &config::Config,
+    rate: f64,
+) -> Result<(), String> {
+    aggregate
+        .set_latencies(&native_offsets(config, rate))
+        .map_err(|error| {
+            format!("native delay update failed; stopping because its state is uncertain: {error}")
+        })
 }
 
 fn native(args: NativeArgs) -> Result<(), String> {
@@ -675,6 +809,54 @@ mod tests {
         };
         assert_eq!(options.sound, probe::Sound::Pulse);
         assert!(Cli::try_parse_from(["odaud", "test", "room.toml", "--sound", "oops"]).is_err());
+    }
+
+    #[test]
+    fn latency_check_defaults_to_pulses_and_keeps_explicit_options() {
+        let Command::Test { options, .. } =
+            Cli::try_parse_from(["odaud", "test", "room.toml", "--latency-check"])
+                .unwrap()
+                .command
+        else {
+            panic!("wrong command")
+        };
+        assert!(options.latency_check);
+        assert_eq!(options.sound, probe::Sound::Pulse);
+        assert_eq!(options.seconds, 7200.0);
+        let Command::Test { options, .. } = Cli::try_parse_from([
+            "odaud",
+            "test",
+            "room.toml",
+            "--latency-check",
+            "--sound",
+            "chirp",
+            "--seconds",
+            "60",
+        ])
+        .unwrap()
+        .command
+        else {
+            panic!("wrong command")
+        };
+        assert_eq!(options.sound, probe::Sound::Chirp);
+        assert_eq!(options.seconds, 60.0);
+        assert!(Cli::try_parse_from(["odaud", "run", "room.toml", "--latency-check"]).is_err());
+    }
+
+    #[test]
+    fn interactive_delay_changes_skip_disabled_outputs_and_clamp_bounds() {
+        let mut config: config::Config = toml::from_str("[[outputs]]\nuid='a'\ndelay_ms=0.25\n[[outputs]]\nuid='disabled'\nenabled=false\ndelay_ms=25\n[[outputs]]\nuid='b'\ndelay_ms=4999").unwrap();
+        assert!(adjust_delay(&mut config, 0, 1.0).unwrap());
+        assert_eq!(enabled_delays(&config), [1.25, 4999.0]);
+        assert!(adjust_delay(&mut config, 0, -10.0).unwrap());
+        assert!(!adjust_delay(&mut config, 0, -1.0).unwrap());
+        assert!(adjust_delay(&mut config, 1, 10.0).unwrap());
+        assert!(!adjust_delay(&mut config, 1, 1.0).unwrap());
+        assert_eq!(enabled_delays(&config), [0.0, 5000.0]);
+        assert_eq!(config.outputs[1].delay_ms, 25.0);
+        assert!(adjust_delay(&mut config, 2, 1.0).is_err());
+        assert!(adjust_delay(&mut config, 0, f64::NAN).is_err());
+        assert_eq!(enabled_delays(&config), [0.0, 5000.0]);
     }
 
     #[test]

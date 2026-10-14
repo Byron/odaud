@@ -1,6 +1,11 @@
 use serde::Deserialize;
 use std::{
-    collections::HashSet, fs::OpenOptions, io::Read, os::unix::fs::OpenOptionsExt, path::Path,
+    collections::HashSet,
+    fs::{self, OpenOptions},
+    io::{Read, Write},
+    os::unix::fs::{MetadataExt, OpenOptionsExt},
+    path::Path,
+    sync::atomic::{AtomicU64, Ordering},
 };
 
 const MAX_FILE_BYTES: u64 = 1024 * 1024;
@@ -33,6 +38,10 @@ fn default_enabled() -> bool {
 
 impl Config {
     pub fn load(path: &Path) -> Result<Self, String> {
+        Self::load_with_source(path).map(|(config, _)| config)
+    }
+
+    pub fn load_with_source(path: &Path) -> Result<(Self, String), String> {
         // Darwin O_NONBLOCK lets us reject a FIFO without waiting for a writer, including a replacement race.
         let file = OpenOptions::new()
             .read(true)
@@ -56,7 +65,111 @@ impl Config {
         let config: Self =
             toml::from_str(&text).map_err(|e| format!("Parse {}: {e}", path.display()))?;
         config.validate()?;
-        Ok(config)
+        Ok((config, text))
+    }
+
+    /// Save only enabled output delays, retaining the original document and rejecting external edits.
+    pub fn save_delays(&self, path: &Path, original: &str) -> Result<String, String> {
+        self.validate()?;
+        let read_original = || {
+            let metadata = fs::symlink_metadata(path)
+                .map_err(|error| format!("Inspect {} before saving: {error}", path.display()))?;
+            if !metadata.is_file() || metadata.nlink() != 1 {
+                return Err(
+                    "Saving requires a regular configuration file without symbolic or hard links"
+                        .to_string(),
+                );
+            }
+            let (config, source) = Self::load_with_source(path)?;
+            if source != original {
+                return Err("Configuration changed on disk; reload it before saving".to_string());
+            }
+            Ok((config, metadata))
+        };
+        let (current, metadata) = read_original()?;
+        if !self.same_topology(&current) {
+            return Err(
+                "Saving delays cannot change the device name or enabled output topology".into(),
+            );
+        }
+        let mut document: toml_edit::DocumentMut = original
+            .parse()
+            .map_err(|error| format!("Parse configuration for saving: {error}"))?;
+        for (index, old) in current
+            .outputs
+            .iter()
+            .enumerate()
+            .filter(|(_, o)| o.enabled)
+        {
+            let output = self
+                .enabled()
+                .find(|output| output.uid == old.uid)
+                .ok_or("Enabled output disappeared while saving")?;
+            if output.delay_ms == old.delay_ms {
+                continue;
+            }
+            let table = document
+                .get_mut("outputs")
+                .and_then(|outputs| outputs.get_mut(index))
+                .and_then(toml_edit::Item::as_table_like_mut)
+                .ok_or("Cannot locate output table while saving")?;
+            let mut value = toml_edit::Value::from(output.delay_ms);
+            if let Some(previous) = table.get("delay_ms").and_then(toml_edit::Item::as_value) {
+                *value.decor_mut() = previous.decor().clone();
+            }
+            table.insert("delay_ms", toml_edit::Item::Value(value));
+        }
+        let rendered = document.to_string();
+        if rendered.len() as u64 > MAX_FILE_BYTES {
+            return Err("Updated configuration exceeds the 1 MiB limit".into());
+        }
+        let validated: Self = toml::from_str(&rendered)
+            .map_err(|error| format!("Validate updated configuration: {error}"))?;
+        validated.validate()?;
+        if !self.same_topology(&validated)
+            || self
+                .enabled()
+                .zip(validated.enabled())
+                .any(|(expected, actual)| expected.delay_ms != actual.delay_ms)
+        {
+            return Err("Updated configuration does not match the requested output delays".into());
+        }
+
+        static NEXT_SAVE: AtomicU64 = AtomicU64::new(0);
+        let temporary = path.with_file_name(format!(
+            ".odaud-save-{}-{}.tmp",
+            std::process::id(),
+            NEXT_SAVE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&temporary)
+            .map_err(|error| format!("Create {}: {error}", temporary.display()))?;
+        let save = (|| {
+            file.write_all(rendered.as_bytes())
+                .and_then(|()| file.set_permissions(metadata.permissions()))
+                .and_then(|()| file.sync_all())
+                .map_err(|error| format!("Write {}: {error}", temporary.display()))?;
+            let (_, latest) = read_original()?;
+            if latest.dev() != metadata.dev()
+                || latest.ino() != metadata.ino()
+                || latest.mode() != metadata.mode()
+            {
+                return Err(
+                    "Configuration was replaced or its permissions changed while saving".into(),
+                );
+            }
+            // shortcut: other editors can race this final check; coordinate writers if concurrent saves are needed.
+            fs::rename(&temporary, path)
+                .map_err(|error| format!("Replace {}: {error}", path.display()))
+        })();
+        if save.is_err() {
+            let _ = fs::remove_file(&temporary);
+        }
+        save?;
+        Ok(rendered)
     }
 
     pub fn validate(&self) -> Result<(), String> {
@@ -110,8 +223,36 @@ mod tests {
     use super::*;
     use std::{
         fs,
+        os::unix::fs::{PermissionsExt, symlink},
+        path::PathBuf,
         sync::atomic::{AtomicU64, Ordering},
     };
+
+    struct ConfigFile {
+        directory: PathBuf,
+        path: PathBuf,
+    }
+
+    impl ConfigFile {
+        fn new(source: &str) -> Self {
+            static NEXT: AtomicU64 = AtomicU64::new(0);
+            let directory = std::env::temp_dir().join(format!(
+                "odaud-save-test-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir(&directory).unwrap();
+            let path = directory.join("outputs.toml");
+            fs::write(&path, source).unwrap();
+            Self { directory, path }
+        }
+    }
+
+    impl Drop for ConfigFile {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.directory);
+        }
+    }
 
     fn parse(text: &str) -> Result<Config, String> {
         let config: Config = toml::from_str(text).map_err(|e| e.to_string())?;
@@ -257,6 +398,106 @@ mod tests {
         let result = Config::load(&path);
         fs::remove_file(&path).unwrap();
         assert_eq!(result.unwrap().outputs[0].uid, "a");
+    }
+
+    #[test]
+    fn saves_enabled_delays_preserving_comments_disabled_outputs_and_permissions() {
+        let source = "# Listening room\nname = 'Desk'\n[[outputs]] # reference\nuid = 'a'\ndelay_ms = 2.5 # measured\n\n[[outputs]]\nuid = 'unused'\nenabled = false\ndelay_ms = 7 # leave this alone\n\n[[outputs]]\nuid = 'b'\n";
+        let file = ConfigFile::new(source);
+        fs::set_permissions(&file.path, fs::Permissions::from_mode(0o640)).unwrap();
+        let (mut config, baseline) = Config::load_with_source(&file.path).unwrap();
+        assert_eq!(baseline, source);
+        config.outputs[0].delay_ms = 3.5;
+        config.outputs[1].delay_ms = 99.0;
+        config.outputs[2].delay_ms = 4.0;
+        let saved = config.save_delays(&file.path, &baseline).unwrap();
+        assert_eq!(saved, source.replace("2.5", "3.5") + "delay_ms = 4.0\n");
+        assert_eq!(fs::read_to_string(&file.path).unwrap(), saved);
+        assert_eq!(
+            fs::metadata(&file.path).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+        let (loaded, new_baseline) = Config::load_with_source(&file.path).unwrap();
+        assert_eq!(loaded.outputs[0].delay_ms, 3.5);
+        assert_eq!(loaded.outputs[1].delay_ms, 7.0);
+        assert_eq!(loaded.outputs[2].delay_ms, 4.0);
+        assert_eq!(new_baseline, saved);
+        config.outputs[0].delay_ms = 5.0;
+        assert!(config.save_delays(&file.path, &new_baseline).is_ok());
+        assert_eq!(fs::read_dir(&file.directory).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn saves_inline_tables_without_reformatting_other_values() {
+        let source = "outputs = [{ uid = 'a', delay_ms = 2.0 }, { uid = 'b', enabled = false, delay_ms = 7.0 }] # original layout\n";
+        let file = ConfigFile::new(source);
+        let mut config = Config::load(&file.path).unwrap();
+        config.outputs[0].delay_ms = 12.0;
+        assert_eq!(
+            config.save_delays(&file.path, source).unwrap(),
+            source.replace("2.0", "12.0")
+        );
+    }
+
+    #[test]
+    fn refuses_stale_or_invalid_saves_without_changing_the_original() {
+        let source = "[[outputs]]\nuid = 'a'\ndelay_ms = 2.0\n";
+        let file = ConfigFile::new(source);
+        let mut config = Config::load(&file.path).unwrap();
+        config.outputs[0].delay_ms = 3.0;
+        let external = format!("{source}# external edit\n");
+        fs::write(&file.path, &external).unwrap();
+        assert!(
+            config
+                .save_delays(&file.path, source)
+                .unwrap_err()
+                .contains("changed on disk")
+        );
+        assert_eq!(fs::read_to_string(&file.path).unwrap(), external);
+        fs::write(&file.path, source).unwrap();
+        config.outputs[0].delay_ms = f64::NAN;
+        assert!(config.save_delays(&file.path, source).is_err());
+        config.outputs[0].delay_ms = 3.0;
+        config.name = "Different name".into();
+        assert!(
+            config
+                .save_delays(&file.path, source)
+                .unwrap_err()
+                .contains("topology")
+        );
+        assert_eq!(fs::read_to_string(&file.path).unwrap(), source);
+        assert_eq!(fs::read_dir(&file.directory).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn refuses_to_replace_symbolic_and_hard_links() {
+        let source = "[[outputs]]\nuid = 'a'\n";
+        let file = ConfigFile::new(source);
+        let mut config = Config::load(&file.path).unwrap();
+        config.outputs[0].delay_ms = 1.0;
+        let symbolic = file.directory.join("symbolic.toml");
+        symlink(&file.path, &symbolic).unwrap();
+        assert!(
+            config
+                .save_delays(&symbolic, source)
+                .unwrap_err()
+                .contains("symbolic")
+        );
+        assert!(
+            fs::symlink_metadata(&symbolic)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        let hard = file.directory.join("hard.toml");
+        fs::hard_link(&file.path, hard).unwrap();
+        assert!(
+            config
+                .save_delays(&file.path, source)
+                .unwrap_err()
+                .contains("hard links")
+        );
+        assert_eq!(fs::read_to_string(&file.path).unwrap(), source);
     }
 
     #[test]

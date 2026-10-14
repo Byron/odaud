@@ -75,6 +75,7 @@ Survival across reboot, logout, or an audio-server restart is unverified.
 ./target/release/odaud test examples/bose.toml
 ./target/release/odaud test examples/bose.toml --seconds 120
 ./target/release/odaud test examples/bose.toml --sound pulse --seconds 120
+./target/release/odaud test examples/bose.toml --latency-check
 ```
 
 `test` creates the configured device and emits a quiet 20 ms chirp each second
@@ -93,6 +94,43 @@ the changes. The same configuration validation and shutdown handling as
 `run` apply. Choose a duration at least one second longer than the largest
 configured delay. Use `odaud test --help` or `odaud --help` for generated CLI
 help.
+
+## Adjust delays interactively
+
+`test CONFIG.toml --latency-check` opens inline terminal controls without an
+alternate screen. It defaults to the predictable pulse pattern. Use
+`--sound chirp` to choose chirps instead. The check runs until you quit, with
+a two-hour limit; `--seconds` sets a shorter limit for the whole session.
+It requires a terminal and at least two enabled outputs in the configuration.
+
+While choosing a device, only the **first enabled physical output** plays the
+reference sound, without the configured aggregate delay. Up/Down highlights
+an output; Enter selects its delay for adjustment and starts playback through
+all configured outputs. The aggregate stays available throughout the session.
+
+| Key while adjusting | Action |
+| --- | --- |
+| Up / Down | Increase / decrease the selected delay by 1 ms |
+| Right / Left | Increase / decrease it by 10 ms |
+| Esc | Return to device selection and single-speaker reference playback |
+| s | Save the current delays to the configuration file |
+| q or Ctrl-C | Stop, remove the test device, and print the final values |
+
+Delay changes apply immediately through Core Audio, bounded to 0–5000 ms.
+Switching between reference and comparison stops one source before starting
+the other; it can introduce a brief gap. The displayed delay is the requested
+compensation, not a measurement of total acoustic latency. Listen from your
+usual position and adjust the earlier output until the attacks sound together.
+
+Changes stay in memory until you press **s**, which works in either mode.
+Saving preserves comments, other configuration fields, and file permissions.
+It refuses symbolic/hard links and files changed since the last load or save;
+avoid editing the same file concurrently with saving. SIGHUP reloads the file
+and replaces unsaved adjustments. Final values are printed on exit whether
+or not you saved, including when the session stops on an error or signal.
+
+The check uses its own temporary device. After saving, use `run CONFIG.toml`
+or `persist CONFIG.toml --force` to use the calibrated settings normally.
 
 ## Configuration
 
@@ -146,16 +184,16 @@ restart were tested. Actual sleep/wake and sample-rate-change checks remain pend
 
 ## Align the speakers
 
-1. Start with both delays at zero. Run `odaud test CONFIG.toml --seconds 120`
-   and listen from your usual position.
-2. Identify the earlier speaker. Increase **that output's** `delay_ms` in the
-   TOML file, then send SIGHUP to the printed process ID.
+1. Start with both delays at zero. Run `odaud test CONFIG.toml --latency-check`
+   and listen to the single-speaker reference from your usual position.
+2. Select the earlier speaker, press Enter, and increase **that output's** delay
+   with the arrow keys while both outputs play.
 3. Adjust in small steps until the two attacks sound as close as possible.
    If the order reverses, reduce the added delay.
 4. Keep one output near zero where practical; adding the same delay to both
    does not improve relative alignment.
-5. Recheck after moving speakers, changing connections, or changing the
-   listening position. The saved file supplies the same settings next run.
+5. Press s to save. Recheck after moving speakers, changing connections, or
+   changing the listening position. The saved file supplies the same settings next run.
 
 ## Inspect devices and recover after a crash
 
@@ -192,6 +230,7 @@ documented in [the feasibility record](docs/feasibility.md); they are test
 tools, not recording or process-capture features of normal routing.
 
 The audio path uses Apple's native frameworks through Rust FFI. Argument
-parsing uses Clap derives; configuration uses Serde and TOML.
+parsing uses Clap derives; configuration uses Serde, TOML, and toml_edit.
+Crossterm supplies keyboard input and terminal control for the inline editor.
 [Dependency evidence](docs/dependencies.md) records every
 locked version, license, maintenance check, and applicable security advisory.

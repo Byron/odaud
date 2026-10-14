@@ -8,20 +8,21 @@ manifests, upstream GitHub repositories, and the RustSec advisory database.
 The audio engine uses **no third-party audio dependencies**. It uses Rust's
 standard library and narrowly scoped Rust FFI to Apple's installed Core Audio,
 Core Foundation, and IOKit frameworks. These are platform
-facilities, not vendored implementations of audio primitives. No UI toolkit,
-resampler, ring-buffer crate, plugin host, or asynchronous runtime is used.
-Clap is adopted for argument parsing, and Serde and TOML for configuration
-parsing, as detailed below.
+facilities, not vendored implementations of audio primitives. No graphical UI
+toolkit, resampler, ring-buffer crate, plugin host, or asynchronous runtime is
+used. Clap handles argument parsing, Serde and TOML parse configuration,
+Crossterm handles inline terminal interaction, and TOML edit preserves comments
+when saving explicitly requested delay changes, as detailed below.
 
 The native framework definitions must be checked against the installed macOS
 SDK. Rust owns callback state and buffers; Apple's frameworks retain their
 platform implementation and licensing. Build tools such as Cargo, rustc, and
 Apple's linker are build prerequisites, not application runtime dependencies.
 
-`Cargo.lock` records twenty-two third-party packages. Eighteen occur in the active
-normal/build graph; four are locked optional dependencies excluded by the
-selected features. Both groups were audited. Keep the lockfile with the source
-and use `--locked` for reproducible builds.
+`Cargo.lock` records forty-seven third-party packages. Forty-one occur in the
+active macOS normal/build graph; six are locked dependencies excluded by the
+selected features or target. Both groups were audited. Keep the lockfile with
+the source and use `--locked` for reproducible builds.
 
 ## Argument parser and approved exception
 
@@ -72,10 +73,10 @@ toml = { version = "1.1.8", default-features = false, features = ["std", "serde"
 ```
 
 The TOML release's full version is `1.1.8+spec-1.1.0`; dependency requirements
-omit its build metadata. Disabling default features excludes the TOML writer,
-ordered-map preservation, debug colors, and their dependencies from the active
-build. Some optional packages remain in Cargo's lockfile. The declared minimum
-Rust version of every locked package is at most 1.85.
+omit its build metadata. Disabling default features excludes serialization and
+debug colors from the `toml` parser. The separate `toml_edit` dependency enables the writer and ordered
+maps for explicit, comment-preserving saves. The declared minimum Rust version
+of every locked package is at most 1.85.
 
 | Crate | Verified version | Release date | License | Upstream |
 | --- | --- | --- | --- | --- |
@@ -95,14 +96,15 @@ Rust version of every locked package is at most 1.85.
 These are the twelve active configuration and shared macro crates, verified with
 `cargo tree --locked --edges normal,build` and
 `cargo tree --locked --edges features`. All have stable versions at least 1.0,
-recent releases, and unarchived, maintained upstreams. The configuration feature
-tree contains no serializer, ordered-map, debug-color, or asynchronous runtime
-crate.
+recent releases, and unarchived, maintained upstreams. The TOML parser has no
+serialization feature enabled; the writer and ordered-map crates below are
+activated separately by `toml_edit`. No debug-color or asynchronous-runtime
+feature is enabled.
 
-The following four packages also appear in `Cargo.lock`, but do not appear in
-the active normal/build graph:
+The following four packages were originally locked but inactive; all four now
+occur in the active normal/build graph through `toml_edit`:
 
-| Locked optional crate | Version | Release date | License | Upstream |
+| TOML editor support crate | Version | Release date | License | Upstream |
 | --- | --- | --- | --- | --- |
 | equivalent | 1.0.3 | 2026-10-13 | Apache-2.0 OR MIT | [indexmap-rs/equivalent](https://github.com/indexmap-rs/equivalent) |
 | hashbrown | 0.17.1 | 2026-05-09 | MIT OR Apache-2.0 | [rust-lang/hashbrown](https://github.com/rust-lang/hashbrown) |
@@ -116,10 +118,11 @@ The other three qualify through stable versions at least 1.0 and maintained
 upstreams; [equivalent's release](https://github.com/indexmap-rs/equivalent/commit/199fd8460ab195708e40aac61b5df2962189b14d)
 and [indexmap's release](https://github.com/indexmap-rs/indexmap/commit/0fb7b5c813c94dcb16f220d249e42a7b9e4ea44d)
 provide additional dated evidence. No policy exception is needed for these
-configuration dependencies; the sole adopted exception is `heck` above.
+configuration dependencies. Terminal dependencies have their own exception
+recorded below.
 
-Every one of the twenty-two locked package versions was checked against the
-live crates.io version metadata: all were the current stable version,
+The twenty-two original package versions were checked against the live
+crates.io version metadata: all were the current stable version,
 non-yanked, and had a checksum matching `Cargo.lock`. All thirteen upstream
 repositories were checked as unarchived; the maintenance-policy exception for
 `heck` is explicit above. This is a metadata
@@ -133,6 +136,112 @@ agree on 1.0.229; [TOML's version API](https://crates.io/api/v1/crates/toml/1.1.
 and [upstream release manifest](https://github.com/toml-rs/toml/blob/ceac6e4412420d5a5c19e4f7293ad005cf1a31b2/crates/toml/Cargo.toml)
 agree on 1.1.8+spec-1.1.0. Both API records were non-yanked. The recheck's HTTP
 response date was 2026-10-14.
+
+## Inline terminal interaction and explicit configuration saving
+
+```toml
+crossterm = { version = "0.29.0", default-features = false, features = ["events"] }
+toml_edit = "0.25.17"
+```
+
+Crossterm provides keyboard-event polling, raw-terminal handling, and cursor
+commands without an alternate screen. Only `events` is enabled: no async event
+stream, clipboard, mouse opt-in, Windows backend, derive helpers, or extra UI
+framework is needed. Its internal locks and event handling run on the control
+thread, never in an audio callback. TOML edit's default `parse` and `display`
+features preserve comments and formatting when the user explicitly saves;
+Serde integration and debug features are disabled. The full editor release is
+`0.25.17+spec-1.1.0`, with build metadata omitted from the dependency requirement.
+
+| Added active crate | Locked version | Release date | License | Upstream |
+| --- | --- | --- | --- | --- |
+| crossterm | 0.29.0 | 2025-04-05 | MIT | [crossterm-rs/crossterm](https://github.com/crossterm-rs/crossterm) |
+| bitflags | 2.13.2 | 2026-09-10 | MIT OR Apache-2.0 | [bitflags/bitflags](https://github.com/bitflags/bitflags) |
+| document-features | 0.2.12 | 2025-10-24 | MIT OR Apache-2.0 | [slint-ui/document-features](https://github.com/slint-ui/document-features) |
+| litrs | 1.0.1 | 2026-10-12 | MIT OR Apache-2.0 | [LukasKalbertodt/litrs](https://github.com/LukasKalbertodt/litrs) |
+| mio | 1.2.4 | 2026-10-03 | MIT | [tokio-rs/mio](https://github.com/tokio-rs/mio) |
+| libc | 0.2.190 | 2026-10-02 | MIT OR Apache-2.0 | [rust-lang/libc](https://github.com/rust-lang/libc) |
+| log | 0.4.34 | 2026-08-22 | MIT OR Apache-2.0 | [rust-lang/log](https://github.com/rust-lang/log) |
+| parking_lot | 0.12.5 | 2025-10-03 | MIT OR Apache-2.0 | [Amanieu/parking_lot](https://github.com/Amanieu/parking_lot) |
+| parking_lot_core | 0.9.12 | 2025-10-03 | MIT OR Apache-2.0 | [Amanieu/parking_lot](https://github.com/Amanieu/parking_lot) |
+| lock_api | 0.4.14 | 2025-10-03 | MIT OR Apache-2.0 | [Amanieu/parking_lot](https://github.com/Amanieu/parking_lot) |
+| scopeguard | 1.2.0 | 2023-07-17 | MIT OR Apache-2.0 | [bluss/scopeguard](https://github.com/bluss/scopeguard) |
+| cfg-if | 1.0.5 | 2026-09-16 | MIT OR Apache-2.0 | [rust-lang/cfg-if](https://github.com/rust-lang/cfg-if); approved exception below |
+| smallvec | 1.16.3 | 2026-10-10 | MIT OR Apache-2.0 | [servo/rust-smallvec](https://github.com/servo/rust-smallvec) |
+| rustix | 1.1.5 | 2026-09-16 | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT | [bytecodealliance/rustix](https://github.com/bytecodealliance/rustix) |
+| errno | 0.3.14 | 2025-09-09 | MIT OR Apache-2.0 | [lambda-fairy/rust-errno](https://github.com/lambda-fairy/rust-errno) |
+| signal-hook | 0.3.18 | 2025-05-09 | Apache-2.0/MIT | [vorner/signal-hook](https://github.com/vorner/signal-hook) |
+| signal-hook-registry | 1.4.8 | 2025-12-25 | MIT OR Apache-2.0 | [vorner/signal-hook](https://github.com/vorner/signal-hook) |
+| signal-hook-mio | 0.2.5 | 2025-10-26 | MIT OR Apache-2.0 | [vorner/signal-hook](https://github.com/vorner/signal-hook) |
+| toml_edit | 0.25.17+spec-1.1.0 | 2026-10-09 | MIT OR Apache-2.0 | [toml-rs/toml](https://github.com/toml-rs/toml) |
+
+Every upstream in this table was checked as unarchived except the explicit
+`cfg-if` exception. Stable versions at least 1.0 qualify where the project is
+not abandoned; `scopeguard` has no recent release, but is a stable, unarchived
+small utility with no abandonment notice or RustSec advisory. For releases
+below 1.0 that are older than twelve months, substantive maintenance supplies
+the additional evidence:
+
+- Crossterm has an [input-parser fix from 2026-06-02](https://github.com/crossterm-rs/crossterm/commit/d4e9929f9a1c4adf91505d54f8527c817ae504cd)
+  and [terminal-size maintenance from 2026-10-07](https://github.com/crossterm-rs/crossterm/commit/d903fb75619f29ab2d5a4947bbd3dae1bbc0153e).
+  Version 0.29.0 is still the latest published stable release.
+- The parking_lot workspace has [lock API work from 2026-10-03](https://github.com/Amanieu/parking_lot/commit/df8e469c83f9d6374097142270077763296bd07b)
+  and a [core spin-count fix from 2026-10-07](https://github.com/Amanieu/parking_lot/commit/7d52c89a7cd04910e0a762b062bd778d519ea1b0).
+- errno has [new platform support from 2026-08-06](https://github.com/lambda-fairy/rust-errno/commit/58dda7e9b3610fbeeb0b8127c5bc38ce926b9d00).
+- signal-hook's shared upstream has [close-on-exec maintenance from 2026-10-04](https://github.com/vorner/signal-hook/commit/d12e7d9973397a85fe75ca0bc739d7ce01451a7d).
+  Crossterm's constraints resolve signal-hook 0.3.18 and signal-hook-mio 0.2.5;
+  their newer incompatible releases are 0.4.5 and 0.3.0 respectively. The
+  selected versions are non-yanked and have no applicable RustSec advisory.
+- document-features and signal-hook-mio have releases within twelve months;
+  libc and log have releases within six months. TOML edit has both a current
+  release and a [display fix from 2026-10-09](https://github.com/toml-rs/toml/commit/e3a64aa201ec339abacb570417d75b327490cab4).
+
+**Approved exception: `cfg-if` 1.0.5.** Crossterm's mandatory
+`parking_lot` → `parking_lot_core` chain requires it. The upstream is archived,
+and its [2026-09-16 deprecation notice](https://github.com/rust-lang/cfg-if/commit/8b0a2b0fc1fa3b3741b9e72895f390cf499fe36f)
+says the crate was replaced by Rust's `cfg_select!`, promising only breakage
+and security fixes. Its stable 1.0 version therefore does not satisfy the
+non-archived-upstream requirement. This was reported before adoption, and on
+**2026-10-14** the user approved: “Allow the cfg-if exception and use Crossterm”.
+No RustSec advisory was present for cfg-if. The existing `heck` exception
+remains separate and unchanged.
+
+The following six packages are locked but inactive in the macOS normal/build
+graph. They were also checked for licenses, release metadata, and advisories.
+
+| Inactive crate | Locked version | Release date | License | Upstream |
+| --- | --- | --- | --- | --- |
+| linux-raw-sys | 0.12.1 | 2025-12-23 | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT | [sunfishcode/linux-raw-sys](https://github.com/sunfishcode/linux-raw-sys) |
+| memchr | 2.8.3 | 2026-07-08 | Unlicense OR MIT | [BurntSushi/memchr](https://github.com/BurntSushi/memchr) |
+| redox_syscall | 0.5.18 | 2025-10-04 | MIT | [Redox upstream](https://gitlab.redox-os.org/redox-os/syscall), [maintained mirror](https://github.com/redox-os/syscall) |
+| wasi | 0.11.1+wasi-snapshot-preview1 | 2025-06-10 | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT | [bytecodealliance/wasi](https://github.com/bytecodealliance/wasi) |
+| windows-link | 0.2.1 | 2025-10-06 | MIT OR Apache-2.0 | [microsoft/windows-rs](https://github.com/microsoft/windows-rs) |
+| windows-sys | 0.61.2 | 2025-10-06 | MIT OR Apache-2.0 | [microsoft/windows-rs](https://github.com/microsoft/windows-rs) |
+
+These upstreams are unarchived and maintained. linux-raw-sys qualifies through
+its release, memchr through its stable version and release, and the older
+platform bindings through substantive shared-project maintenance:
+[Redox memory-policy work in August 2026](https://github.com/redox-os/syscall/commit/4cc3baafdcbca65660d7ad4c52b7900e1fd32315),
+[WASI work in September 2026](https://github.com/bytecodealliance/wasi/commit/43007ef51303552f60fd6f1528ec5f778c33e87e),
+and [Windows bindings in October 2026](https://github.com/microsoft/windows-rs/commit/cc1bf12e71bc6c355de0a5090b6a8b529491e498).
+The Redox GitLab API was unavailable; the unarchived upstream GitHub mirror
+supplies that maintenance evidence. Cargo selects the compatible older lines
+of redox_syscall, wasi, and windows-link rather than their newer incompatible
+0.9.4, 0.14.7+wasi-0.2.4, and 0.100.0 releases.
+
+All twenty-five newly locked versions were checked against live crates.io
+metadata as non-yanked, with checksums matching the resolved lockfile. The
+active graph has no duplicate package versions. Console 0.16.6 and Dialoguer
+0.12.0 were considered: their key/prompt interfaces block, so they would need
+additional input-thread or low-level terminal handling to keep the health
+monitor responsive. Inquire 0.9.4 adds prompt abstractions and dependencies
+without simplifying continuous arrow-key adjustment. Termion 4.0.6 was also
+considered; its asynchronous reader has an unbounded queue and detached thread.
+Crossterm supplies event parsing. Version 0.29.0 can block on incomplete escape
+or UTF-8 input despite a zero-timeout poll, so ODAUD temporarily makes stdin
+nonblocking with narrow macOS FFI and restores its flags on exit. A PTY
+regression covers partial input and SIGTERM shutdown. No mouse reporting or
+cursor-position queries are enabled.
 
 ## Audio and UI candidates evaluated, not adopted
 
@@ -193,13 +302,28 @@ maintenance and significant transitive findings:
 ## Security check and future additions
 
 The [RustSec database tree checked](https://github.com/RustSec/advisory-db/tree/6aed84668c23d7f535077a9fe918bf1fa0f6a5bc)
-contained no advisory entries for the eighteen active crates or
-the locked `equivalent`, `indexmap`, and `toml_writer` packages. The one matching
-entry for the twenty-two locked packages was
+contained no advisory entries for the original eighteen active crates or
+`equivalent`, `indexmap`, and `toml_writer`. The original graph's one matching
+entry was
 [RUSTSEC-2024-0402](https://rustsec.org/advisories/RUSTSEC-2024-0402.html),
 non-canonical Borsh serialization in `hashbrown` 0.15.0. It is patched in
-0.15.1 and does not affect locked version 0.17.1. No known unpatched RustSec
-advisory applies to the resolved graph.
+0.15.1 and does not affect locked version 0.17.1.
+
+The same live database was rechecked for all newly locked terminal/editor
+packages. Matching advisories apply only to older versions:
+
+- [RUSTSEC-2020-0070](https://rustsec.org/advisories/RUSTSEC-2020-0070.html):
+  lock_api guard thread-safety issues, patched in 0.4.2; selected 0.4.14.
+- [RUSTSEC-2020-0081](https://rustsec.org/advisories/RUSTSEC-2020-0081.html) and
+  [RUSTSEC-2024-0019](https://rustsec.org/advisories/RUSTSEC-2024-0019.html):
+  mio socket layout and Windows named-pipe issues, patched in 0.7.6 and 0.8.11;
+  selected 1.2.4.
+- smallvec advisories RUSTSEC-2018-0003, RUSTSEC-2018-0018,
+  RUSTSEC-2019-0009, RUSTSEC-2019-0012, and
+  [RUSTSEC-2021-0003](https://rustsec.org/advisories/RUSTSEC-2021-0003.html):
+  historical memory-safety issues, all fixed by 1.6.1; selected 1.16.3.
+
+No known unpatched RustSec advisory applies to the forty-seven locked packages.
 
 The same database check found no entries for the listed objc2 framework
 crates, cidre, coreaudio-rs, CPAL, or Rubato. Relevant audio queue advisories
