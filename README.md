@@ -74,12 +74,19 @@ Survival across reboot, logout, or an audio-server restart is unverified.
 ```sh
 ./target/release/odaud test examples/bose.toml
 ./target/release/odaud test examples/bose.toml --seconds 120
+./target/release/odaud test examples/bose.toml --sound pulse --seconds 120
 ```
 
 `test` creates the configured device and emits a quiet 20 ms chirp each second
 through all enabled outputs, including their configured delays. It needs no
 manual output selection and never changes the system default. It stops after
 30 seconds by default and removes the device; Ctrl-C stops it early.
+
+`--sound pulse` plays a steady four-beat-per-second pattern instead of chirps.
+Each beat is a quiet 60 ms tone, with a higher accent each second and a distinct
+accent at the start of its eight-second phrase. Timing differences can make
+these predictable attacks sound doubled. Both sounds peak at most at -26 dBFS;
+speaker volume and listening position still matter.
 
 While listening, edit the delays and send SIGHUP to the printed PID to hear
 the changes. The same configuration validation and shutdown handling as

@@ -9,7 +9,10 @@ use std::{
     mem::{MaybeUninit, align_of, offset_of, size_of},
     path::Path,
     ptr,
-    sync::atomic::{AtomicU32, AtomicUsize, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering},
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -19,6 +22,14 @@ const OUTPUT: u32 = u32::from_be_bytes(*b"outp");
 const GLOBAL: u32 = u32::from_be_bytes(*b"glob");
 const MAX_CHANNELS: usize = 64;
 const MAX_CAPTURE_BYTES: usize = 64 * 1024 * 1024;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, clap::ValueEnum)]
+pub enum Sound {
+    /// A short chirp each second makes large timing offsets easy to hear.
+    Chirp,
+    /// Repeating accented beats make timing differences audible as doubled hits.
+    Pulse,
+}
 
 #[repr(C)]
 struct Address {
@@ -493,6 +504,7 @@ fn run(
     state: Box<State>,
     seconds: f64,
     unused_scope: u32,
+    stopped: &AtomicBool,
 ) -> Result<Box<State>, String> {
     let mut proc = None;
     let pointer = Box::into_raw(state);
@@ -529,7 +541,7 @@ fn run(
     let mut inspect_at = Instant::now() + Duration::from_millis(250);
     let mut error = None;
     while state.completed.load(Ordering::Acquire) < state.target {
-        if crate::STOP.load(Ordering::Relaxed) {
+        if crate::STOP.load(Ordering::Relaxed) || stopped.load(Ordering::Relaxed) {
             break;
         }
         if state.failure.load(Ordering::Acquire) != 0 {
@@ -601,11 +613,50 @@ fn chirp_cycle(rate: f64) -> Vec<f32> {
     cycle
 }
 
+fn pulse_cycle(rate: f64) -> Vec<f32> {
+    // Exceed the five-second delay limit so a full-loop offset cannot sound aligned.
+    let mut cycle = vec![0.0; (rate * 8.0).round() as usize];
+    let length = (rate * 0.060).round() as usize;
+    for beat in 0..32 {
+        let start = (rate * beat as f64 / 4.0).round() as usize;
+        let frequency = if beat == 0 {
+            880.0
+        } else if beat % 4 == 0 {
+            660.0
+        } else {
+            440.0
+        };
+        for frame in 0..length {
+            let envelope = 0.5 - 0.5 * (TAU * frame as f64 / (length - 1) as f64).cos();
+            let phase = TAU * frequency * frame as f64 / rate;
+            cycle[start + frame] = (0.05 * envelope * phase.sin()) as f32;
+        }
+    }
+    cycle
+}
+
 /// Play a quiet 20 ms chirp each second, mirrored to every output channel.
 pub fn play(device: u32, seconds: f64) -> Result<String, String> {
+    play_sound(device, seconds, Sound::Chirp)
+}
+
+/// Play the same quiet source on every output channel.
+pub fn play_sound(device: u32, seconds: f64, sound: Sound) -> Result<String, String> {
+    play_until_stopped(device, seconds, sound, &AtomicBool::new(false))
+}
+
+fn play_until_stopped(
+    device: u32,
+    seconds: f64,
+    sound: Sound,
+    stopped: &AtomicBool,
+) -> Result<String, String> {
     let layout = Layout::inspect(device, OUTPUT)?;
     let target = frame_count(seconds, layout.rate, 86_400.0)?;
-    let audio = Audio::Source(chirp_cycle(layout.rate));
+    let audio = Audio::Source(match sound {
+        Sound::Chirp => chirp_cycle(layout.rate),
+        Sound::Pulse => pulse_cycle(layout.rate),
+    });
     let state = Box::new(State {
         layout,
         target,
@@ -613,9 +664,13 @@ pub fn play(device: u32, seconds: f64) -> Result<String, String> {
         failure: AtomicU32::new(0),
         realtime: UnsafeCell::new(Realtime { audio, position: 0 }),
     });
-    let state = run(device, state, seconds, INPUT)?;
+    let state = run(device, state, seconds, INPUT, stopped)?;
+    let description = match sound {
+        Sound::Chirp => "20 ms, 700–2800 Hz chirp every second",
+        Sound::Pulse => "four accented 60 ms beats per second (eight-second phrase)",
+    };
     Ok(format!(
-        "Played {} frames at {} Hz to {} channels; 20 ms, 700–2800 Hz chirp every second, peak at most 0.05 (-26 dBFS)",
+        "Played {} frames at {} Hz to {} channels; {description}, peak at most 0.05 (-26 dBFS)",
         state.completed.load(Ordering::Relaxed),
         state.layout.rate,
         state.layout.channels
@@ -623,18 +678,22 @@ pub fn play(device: u32, seconds: f64) -> Result<String, String> {
 }
 
 /// Declare after the owned aggregate so unwinding joins playback before removing the device.
-pub struct ChirpPlayback {
+pub struct Playback {
     worker: Option<thread::JoinHandle<Result<String, String>>>,
+    stopped: Arc<AtomicBool>,
 }
 
-impl ChirpPlayback {
-    pub fn start(device: u32, seconds: f64) -> Result<Self, String> {
+impl Playback {
+    pub fn start(device: u32, seconds: f64, sound: Sound) -> Result<Self, String> {
+        let stopped = Arc::new(AtomicBool::new(false));
+        let worker_stopped = Arc::clone(&stopped);
         let worker = thread::Builder::new()
             .name("odaud-test-playback".into())
-            .spawn(move || play(device, seconds))
+            .spawn(move || play_until_stopped(device, seconds, sound, &worker_stopped))
             .map_err(|error| format!("Start test playback worker: {error}"))?;
         Ok(Self {
             worker: Some(worker),
+            stopped,
         })
     }
 
@@ -649,7 +708,7 @@ impl ChirpPlayback {
     }
 
     fn stop_and_join(&mut self) -> Result<String, String> {
-        crate::STOP.store(true, Ordering::Relaxed);
+        self.stopped.store(true, Ordering::Relaxed);
         self.worker
             .take()
             .ok_or("Test playback was already joined")?
@@ -658,7 +717,7 @@ impl ChirpPlayback {
     }
 }
 
-impl Drop for ChirpPlayback {
+impl Drop for Playback {
     fn drop(&mut self) {
         if self.worker.is_some() {
             let _ = self.stop_and_join();
@@ -690,7 +749,7 @@ pub fn capture(device: u32, seconds: f64, path: &Path) -> Result<String, String>
             position: 0,
         }),
     });
-    let state = run(device, state, seconds, OUTPUT)?;
+    let state = run(device, state, seconds, OUTPUT, &AtomicBool::new(false))?;
     let rate = state.layout.rate as u32;
     let channels = state.layout.channels as u16;
     let captured = state.completed.load(Ordering::Relaxed);
@@ -856,6 +915,73 @@ mod tests {
     }
 
     #[test]
+    fn pulse_pattern_is_deterministic_bounded_and_has_four_beats_per_second() {
+        for rate in [8_000.0, 48_000.0, 768_000.0] {
+            let pulse = pulse_cycle(rate);
+            assert_eq!(pulse.len(), (rate * 8.0) as usize);
+            assert_eq!(pulse, pulse_cycle(rate));
+            assert!(pulse.iter().all(|s| s.is_finite() && s.abs() <= 0.05));
+            let length = (rate * 0.060).round() as usize;
+            for beat in 0..32 {
+                let start = (rate * beat as f64 / 4.0).round() as usize;
+                let end = (rate * (beat + 1) as f64 / 4.0).round() as usize;
+                assert!(pulse[start..start + length].iter().any(|s| s.abs() > 0.01));
+                assert!(pulse[start + length..end].iter().all(|s| *s == 0.0));
+            }
+            assert_ne!(
+                &pulse[..length],
+                &pulse[rate as usize..rate as usize + length]
+            );
+        }
+    }
+
+    #[test]
+    fn pulse_wraps_across_planar_callbacks_and_silences_partial_final_buffer() {
+        let pulse = pulse_cycle(48_000.0);
+        let len = pulse.len();
+        let expected = [pulse[len - 2], pulse[len - 1], pulse[0], pulse[1]];
+        let final_sample = pulse[2];
+        let mut left = [99.0_f32; 4];
+        let mut right = [99.0_f32; 4];
+        let mut output = Pair {
+            count: 2,
+            buffers: [
+                Buffer {
+                    channels: 1,
+                    bytes: 16,
+                    data: left.as_mut_ptr().cast(),
+                },
+                Buffer {
+                    channels: 1,
+                    bytes: 16,
+                    data: right.as_mut_ptr().cast(),
+                },
+            ],
+        };
+        let state = State {
+            layout: layout(vec![1, 1]),
+            target: len + 3,
+            completed: AtomicUsize::new(len - 2),
+            failure: AtomicU32::new(0),
+            realtime: UnsafeCell::new(Realtime {
+                audio: Audio::Source(pulse),
+                position: len - 2,
+            }),
+        };
+        unsafe {
+            invoke(&state, ptr::null(), (&mut output as *mut Pair).cast());
+        }
+        assert_eq!(left, expected);
+        assert_eq!(right, expected);
+        unsafe {
+            invoke(&state, ptr::null(), (&mut output as *mut Pair).cast());
+        }
+        assert_eq!(left, [final_sample, 0.0, 0.0, 0.0]);
+        assert_eq!(right, left);
+        assert_eq!(state.completed.load(Ordering::Relaxed), len + 3);
+    }
+
+    #[test]
     fn layout_change_silences_source_and_latches_failure() {
         let mut samples = [0.5_f32; 4];
         let mut output = BufferList {
@@ -924,27 +1050,27 @@ mod tests {
 
     #[test]
     fn playback_guard_joins_on_finish_and_unwind_and_reports_worker_panic() {
-        use std::sync::{Arc, atomic::AtomicBool};
-
-        crate::STOP.store(false, Ordering::Relaxed);
-        let finished = ChirpPlayback {
+        let finished = Playback {
             worker: Some(thread::spawn(|| Ok("finished".into()))),
+            stopped: Arc::new(AtomicBool::new(false)),
         };
         assert_eq!(finished.finish().unwrap(), "finished");
 
-        crate::STOP.store(false, Ordering::Relaxed);
         let joined = Arc::new(AtomicBool::new(false));
         let worker_joined = Arc::clone(&joined);
+        let stopped = Arc::new(AtomicBool::new(false));
+        let worker_stopped = Arc::clone(&stopped);
         let unwound = std::panic::catch_unwind(move || {
-            let _playback = ChirpPlayback {
+            let _playback = Playback {
                 worker: Some(thread::spawn(move || {
                     let deadline = Instant::now() + Duration::from_secs(1);
-                    while !crate::STOP.load(Ordering::Relaxed) && Instant::now() < deadline {
+                    while !worker_stopped.load(Ordering::Relaxed) && Instant::now() < deadline {
                         thread::sleep(Duration::from_millis(1));
                     }
-                    worker_joined.store(crate::STOP.load(Ordering::Relaxed), Ordering::Release);
+                    worker_joined.store(worker_stopped.load(Ordering::Relaxed), Ordering::Release);
                     Ok("stopped".into())
                 })),
+                stopped,
             };
             panic!("simulated control-thread panic");
         });
@@ -954,10 +1080,14 @@ mod tests {
             "playback must stop and join while unwinding"
         );
 
-        let failed = ChirpPlayback {
+        let failed = Playback {
             worker: Some(thread::spawn(|| panic!("simulated playback worker panic"))),
+            stopped: Arc::new(AtomicBool::new(false)),
         };
         assert!(failed.finish().unwrap_err().contains("panicked"));
-        crate::STOP.store(false, Ordering::Relaxed);
+        assert!(
+            !crate::STOP.load(Ordering::Relaxed),
+            "stopping playback must not stop the application"
+        );
     }
 }

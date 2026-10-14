@@ -61,15 +61,14 @@ enum Command {
         #[arg(long)]
         force: bool,
     },
-    /// Play quiet chirps through the configured outputs and delays, then stop
+    /// Play a quiet test sound through the configured outputs and delays, then stop
     #[command(
-        after_help = "SIGHUP reloads delay edits while chirps play. No manual output selection is needed."
+        after_help = "SIGHUP reloads delay edits while the sound plays. No manual output selection is needed."
     )]
     Test {
         config: PathBuf,
-        /// Test duration in seconds (1–7200); Ctrl-C stops early
-        #[arg(long, default_value = "30", value_parser = test_seconds)]
-        seconds: f64,
+        #[command(flatten)]
+        options: TestOptions,
     },
     /// Remove a persistent ODAUD device or an orphan whose owner has exited
     Cleanup { uid: String },
@@ -88,6 +87,16 @@ enum Command {
         seconds: f64,
         output: PathBuf,
     },
+}
+
+#[derive(Args)]
+struct TestOptions {
+    /// Test duration in seconds (1–7200); Ctrl-C stops early
+    #[arg(long, default_value = "30", value_parser = test_seconds)]
+    seconds: f64,
+    /// Source sound; pulse provides a steady rhythm for comparing speakers
+    #[arg(long, value_enum, default_value = "chirp")]
+    sound: probe::Sound,
 }
 
 #[derive(Args)]
@@ -139,7 +148,7 @@ fn seconds(text: &str) -> Result<f64, String> {
 fn test_seconds(text: &str) -> Result<f64, String> {
     let value = seconds(text)?;
     if value < 1.0 {
-        return Err("chirp tests must last at least one second".into());
+        return Err("audio tests must last at least one second".into());
     }
     Ok(value)
 }
@@ -215,7 +224,7 @@ fn run(command: Command) -> Result<(), String> {
         }
         Command::Run { config } => configured(&config, None)?,
         Command::Persist { config, force } => persist(&config, force)?,
-        Command::Test { config, seconds } => configured(&config, Some(seconds))?,
+        Command::Test { config, options } => configured(&config, Some(&options))?,
         Command::Cleanup { uid } => {
             hal::cleanup(&uid)?;
             println!("removed {uid:?}");
@@ -351,14 +360,14 @@ fn persist(path: &Path, force: bool) -> Result<(), String> {
     Ok(())
 }
 
-fn configured(path: &Path, test_duration: Option<f64>) -> Result<(), String> {
+fn configured(path: &Path, test: Option<&TestOptions>) -> Result<(), String> {
     let mut config = config::Config::load(path)?;
-    if let Some(duration) = test_duration {
+    if let Some(test) = test {
         let max_delay = config
             .enabled()
             .map(|output| output.delay_ms)
             .fold(0.0, f64::max);
-        if duration < max_delay / 1000.0 + 1.0 {
+        if test.seconds < max_delay / 1000.0 + 1.0 {
             return Err(
                 "test duration must exceed the largest configured delay by at least one second"
                     .into(),
@@ -387,9 +396,10 @@ fn configured(path: &Path, test_duration: Option<f64>) -> Result<(), String> {
         selected[0].name
     );
     print_outputs(&config, rate);
-    if let Some(duration) = test_duration {
+    if let Some(test) = test {
         println!(
-            "Playing quiet chirps for {duration} seconds through the configured delays. SIGHUP reloads delays; Ctrl-C stops early."
+            "Playing quiet {:?} for {} seconds through the configured delays. SIGHUP reloads delays; Ctrl-C stops early.",
+            test.sound, test.seconds
         );
     } else {
         println!(
@@ -397,16 +407,13 @@ fn configured(path: &Path, test_duration: Option<f64>) -> Result<(), String> {
         );
     }
     std::io::stdout().flush().map_err(|e| e.to_string())?;
-    let chirps = test_duration
-        .map(|duration| probe::ChirpPlayback::start(aggregate.id, duration))
+    let playback = test
+        .map(|test| probe::Playback::start(aggregate.id, test.seconds, test.sound))
         .transpose()?;
     let mut result = Ok(());
     let mut health_at = Instant::now();
     while !STOP.load(Ordering::Relaxed) {
-        if chirps
-            .as_ref()
-            .is_some_and(probe::ChirpPlayback::is_finished)
-        {
+        if playback.as_ref().is_some_and(probe::Playback::is_finished) {
             break;
         }
         if power.poll() {
@@ -465,7 +472,7 @@ fn configured(path: &Path, test_duration: Option<f64>) -> Result<(), String> {
         }
         std::thread::sleep(Duration::from_millis(25));
     }
-    let playback = chirps.map(probe::ChirpPlayback::finish).transpose();
+    let playback = playback.map(probe::Playback::finish).transpose();
     let cleanup = aggregate.destroy();
     let sleep = power.allow_sleep();
     cleanup?;
@@ -625,22 +632,23 @@ mod tests {
 
     #[test]
     fn cli_parses_chirp_duration_and_rejects_invalid_arguments() {
-        let Command::Test { config, seconds } = Cli::try_parse_from(["odaud", "test", "room.toml"])
+        let Command::Test { config, options } = Cli::try_parse_from(["odaud", "test", "room.toml"])
             .unwrap()
             .command
         else {
             panic!("wrong command")
         };
         assert_eq!(config, Path::new("room.toml"));
-        assert_eq!(seconds, 30.0);
-        let Command::Test { seconds, .. } =
+        assert_eq!(options.seconds, 30.0);
+        assert_eq!(options.sound, probe::Sound::Chirp);
+        let Command::Test { options, .. } =
             Cli::try_parse_from(["odaud", "test", "room.toml", "--seconds", "45"])
                 .unwrap()
                 .command
         else {
             panic!("wrong command")
         };
-        assert_eq!(seconds, 45.0);
+        assert_eq!(options.seconds, 45.0);
         for duration in ["0", "0.1", "NaN", "inf", "-1", "7201"] {
             assert!(
                 Cli::try_parse_from(["odaud", "test", "room.toml", "--seconds", duration]).is_err()
@@ -654,6 +662,19 @@ mod tests {
         ] {
             assert!(Cli::try_parse_from(args).is_err());
         }
+    }
+
+    #[test]
+    fn cli_accepts_pulse_and_rejects_unknown_sounds() {
+        let Command::Test { options, .. } =
+            Cli::try_parse_from(["odaud", "test", "room.toml", "--sound", "pulse"])
+                .unwrap()
+                .command
+        else {
+            panic!("wrong command")
+        };
+        assert_eq!(options.sound, probe::Sound::Pulse);
+        assert!(Cli::try_parse_from(["odaud", "test", "room.toml", "--sound", "oops"]).is_err());
     }
 
     #[test]

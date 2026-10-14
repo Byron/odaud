@@ -64,6 +64,7 @@ elevation, privileged helper, reboot, or separately installed service was used.
 | USB disconnection | Physical Bose unplug stopped ODAUD and removed its aggregate. The Bose was visible after reconnection, and the release build successfully restarted. |
 | Release build | Startup and a 25 ms reload passed native composition readback. A name change was rejected during reload. SIGTERM removed the device, and a separate enumeration confirmed no ODAUD devices remained. |
 | Configuration chirp command | `test examples/bose.toml --seconds 5` sent 240,000 frames through the stereo aggregate and removed it automatically. A second test accepted a 50 ms SIGHUP edit and stopped cleanly on SIGINT after joining its playback worker. |
+| Pulse test sound | `test examples/bose.toml --sound pulse --seconds 3` submitted 144,000 frames of the accented four-beat-per-second pattern through the configured aggregate and removed the device automatically. |
 | Persistent device after exit | `persist` exited successfully. Separate enumeration and inspection found the public stereo device at 48 kHz with the requested 2,400-frame built-in offset. A separate chirp client then submitted 144,000 frames through it. This check did not include a new acoustic measurement or listening confirmation. |
 | Persistent replacement and removal | A repeat without `--force` failed; invalid delays and an unavailable output with `--force` left the existing device intact. Valid replacement changed the name and built-in offset to 3,600 frames. Explicit cleanup removed the device; default and system-default output IDs stayed 73 throughout. Core Audio reused the numeric device ID across recreation. |
 
@@ -149,7 +150,7 @@ Outstanding hardware validation:
 - Recheck visibility, stream composition, and cleanup on other macOS versions
   before claiming support for them.
 
-All 30 automated tests pass, along with Clippy with warnings denied and the
+All 33 automated tests pass, along with Clippy with warnings denied and the
 locked release build. Tests cover the implementation's own parsing, bounds,
 configuration transitions, control inputs, and diagnostic buffer handling.
 Compilation and those tests do not complete the outstanding hardware checks.
