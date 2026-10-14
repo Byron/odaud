@@ -10,22 +10,61 @@ standard library and narrowly scoped Rust FFI to Apple's installed Core Audio,
 Core Foundation, and IOKit frameworks. These are platform
 facilities, not vendored implementations of audio primitives. No UI toolkit,
 resampler, ring-buffer crate, plugin host, or asynchronous runtime is used.
-Serde and TOML are adopted for configuration parsing, as detailed below.
+Clap is adopted for argument parsing, and Serde and TOML for configuration
+parsing, as detailed below.
 
 The native framework definitions must be checked against the installed macOS
 SDK. Rust owns callback state and buffers; Apple's frameworks retain their
 platform implementation and licensing. Build tools such as Cargo, rustc, and
 Apple's linker are build prerequisites, not application runtime dependencies.
 
-`Cargo.lock` records sixteen third-party packages. Twelve occur in the active
+`Cargo.lock` records twenty-two third-party packages. Eighteen occur in the active
 normal/build graph; four are locked optional dependencies excluded by the
 selected features. Both groups were audited. Keep the lockfile with the source
 and use `--locked` for reproducible builds.
 
+## Argument parser and approved exception
+
+```toml
+clap = { version = "4.6.7", default-features = false, features = ["std", "derive", "help", "usage", "error-context"] }
+```
+
+The `derive` feature supplies `clap_derive` through Clap's normal reexports;
+it does not need a separate direct dependency. Help, usage, and error context
+are enabled. Color, suggestions, wrapping, and Markdown support are disabled,
+so their optional dependencies are absent. The selected Clap release requires
+Rust 1.85.
+
+| Added crate | Locked version | Release date | License | Upstream |
+| --- | --- | --- | --- | --- |
+| clap | 4.6.7 | 2026-09-14 | MIT OR Apache-2.0 | [clap-rs/clap](https://github.com/clap-rs/clap) |
+| clap_builder | 4.6.7 | 2026-09-14 | MIT OR Apache-2.0 | [clap-rs/clap](https://github.com/clap-rs/clap) |
+| clap_derive | 4.6.7 | 2026-09-14 | MIT OR Apache-2.0 | [clap-rs/clap](https://github.com/clap-rs/clap) |
+| clap_lex | 1.1.1 | 2026-09-14 | MIT OR Apache-2.0 | [clap-rs/clap](https://github.com/clap-rs/clap) |
+| anstyle | 1.0.14 | 2026-03-13 | MIT OR Apache-2.0 | [rust-cli/anstyle](https://github.com/rust-cli/anstyle) |
+| heck | 0.5.0 | 2024-03-12 | MIT OR Apache-2.0 | [withoutboats/heck](https://github.com/withoutboats/heck) |
+
+All six are present in the active normal/build graph. `clap_derive` also uses
+the existing `proc-macro2`, `quote`, and `syn` versions listed below; no duplicate
+versions are introduced. `clap_lex`, `anstyle`, and `heck` have no dependencies.
+The Clap and anstyle upstreams are unarchived and maintained, and their
+selected versions qualify through stable versions above 1.0 and recent
+releases.
+
+**Approved exception: `heck` 0.5.0.** It is an unavoidable dependency of the
+requested `clap_derive` feature. Its version is below 1.0, its release was on
+2024-03-12, and its latest upstream maintenance was
+[tests](https://github.com/withoutboats/heck/commit/df22272ad96508108ec7fdf0a716bfbe82184337)
+and [CI updates](https://github.com/withoutboats/heck/commit/252c1906cefefb8d13ecad7fce7b8f27ce6437e0)
+on 2025-08-09, outside the required twelve-month window. This exception was
+reported before adoption. On **2026-10-14**, the user explicitly approved it:
+“Allow the exception; use clap_derive”. Its upstream is not archived, and the
+RustSec check found no advisory for it. This approval applies to `heck` for
+Clap derives, not to other dependency-policy exceptions.
+
 ## Configuration dependencies
 
-The configuration-first CLI adopts the following dependency declarations.
-Argument handling uses `std::env`.
+Configuration parsing uses the following dependency declarations.
 
 ```toml
 serde = { version = "1.0.229", features = ["derive"] }
@@ -53,11 +92,12 @@ Rust version of every locked package is at most 1.85.
 | syn | 3.0.9 | 2026-10-12 | MIT OR Apache-2.0 | [dtolnay/syn](https://github.com/dtolnay/syn) |
 | unicode-ident | 1.0.27 | 2026-10-12 | (MIT OR Apache-2.0) AND Unicode-3.0 | [dtolnay/unicode-ident](https://github.com/dtolnay/unicode-ident) |
 
-These are the twelve active third-party crates, verified with
+These are the twelve active configuration and shared macro crates, verified with
 `cargo tree --locked --edges normal,build` and
 `cargo tree --locked --edges features`. All have stable versions at least 1.0,
-recent releases, and unarchived, maintained upstreams. The active feature tree
-contains no serializer, ordered-map, debug-color, or additional runtime crate.
+recent releases, and unarchived, maintained upstreams. The configuration feature
+tree contains no serializer, ordered-map, debug-color, or asynchronous runtime
+crate.
 
 The following four packages also appear in `Cargo.lock`, but do not appear in
 the active normal/build graph:
@@ -75,13 +115,14 @@ within six months and maintained, unarchived upstream, including an
 The other three qualify through stable versions at least 1.0 and maintained
 upstreams; [equivalent's release](https://github.com/indexmap-rs/equivalent/commit/199fd8460ab195708e40aac61b5df2962189b14d)
 and [indexmap's release](https://github.com/indexmap-rs/indexmap/commit/0fb7b5c813c94dcb16f220d249e42a7b9e4ea44d)
-provide additional dated evidence. No policy exception is needed for the
-resolved graph.
+provide additional dated evidence. No policy exception is needed for these
+configuration dependencies; the sole adopted exception is `heck` above.
 
-Every one of the sixteen locked package versions was rechecked against the
+Every one of the twenty-two locked package versions was checked against the
 live crates.io version metadata: all were the current stable version,
-non-yanked, and had a checksum matching `Cargo.lock`. All ten upstream
-repositories were rechecked as unarchived and maintained. This is a metadata
+non-yanked, and had a checksum matching `Cargo.lock`. All thirteen upstream
+repositories were checked as unarchived; the maintenance-policy exception for
+`heck` is explicit above. This is a metadata
 and dependency-graph audit, not a claim to have reviewed every dependency's
 source code.
 
@@ -152,9 +193,9 @@ maintenance and significant transitive findings:
 ## Security check and future additions
 
 The [RustSec database tree checked](https://github.com/RustSec/advisory-db/tree/6aed84668c23d7f535077a9fe918bf1fa0f6a5bc)
-contained no advisory entries for the twelve active configuration crates or
+contained no advisory entries for the eighteen active crates or
 the locked `equivalent`, `indexmap`, and `toml_writer` packages. The one matching
-entry for the sixteen locked packages was
+entry for the twenty-two locked packages was
 [RUSTSEC-2024-0402](https://rustsec.org/advisories/RUSTSEC-2024-0402.html),
 non-canonical Borsh serialization in `hashbrown` 0.15.0. It is patched in
 0.15.1 and does not affect locked version 0.17.1. No known unpatched RustSec

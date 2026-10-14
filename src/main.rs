@@ -6,8 +6,9 @@ mod hal;
 mod power;
 mod probe;
 
+use clap::{Args, Parser, Subcommand};
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -26,31 +27,69 @@ extern "C" fn on_signal(number: i32) {
     }
 }
 
-const HELP: &str = "ODAUD — temporary stereo output with native delay compensation
+#[derive(Parser)]
+#[command(
+    version,
+    about = "Temporary macOS stereo output with native delay compensation"
+)]
+#[command(
+    after_help = "SIGHUP reloads delays; Ctrl-C stops and removes the device. System defaults are never changed."
+)]
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
+}
 
-  odaud devices [--all]
-  odaud inspect UID
-  odaud check CONFIG.toml
-  odaud run CONFIG.toml
-  odaud cleanup ORPHAN_UID
+#[derive(Subcommand)]
+enum Command {
+    /// List physical output devices and their stable UIDs
+    Devices {
+        /// Include aggregate, virtual, and input devices
+        #[arg(long)]
+        all: bool,
+    },
+    /// Inspect a device's formats, clocks, and reported latencies
+    Inspect { uid: String },
+    /// Validate a configuration and connected outputs without creating a device
+    Check { config: PathBuf },
+    /// Run the configured output until Ctrl-C; select it in macOS or your player
+    Run { config: PathBuf },
+    /// Remove an exact orphaned ODAUD UID whose owner has exited
+    Cleanup { uid: String },
+    /// Experiment with native aggregate settings
+    ProbeNative(NativeArgs),
+    /// Play quiet chirps to an existing device UID
+    ProbePlay {
+        uid: String,
+        #[arg(value_parser = seconds)]
+        seconds: f64,
+    },
+    /// Record a short diagnostic WAV from an input UID
+    ProbeCapture {
+        uid: String,
+        #[arg(value_parser = capture_seconds)]
+        seconds: f64,
+        output: PathBuf,
+    },
+}
 
-Use stable UIDs from 'devices' in the configuration. Run stays in the foreground.
-SIGHUP reloads delays; SIGINT/SIGTERM stops and removes the temporary output.
-Select ODAUD in the macOS sound controls or another application's output selector.
-ODAUD never changes the default output. Output/name changes require restart.
-
-Experimental diagnostic commands:
-  odaud probe-native STACKED SECONDS RELOAD_FILE_OR_DASH UID DELAY_MS [UID DELAY_MS ...]
-  odaud probe-play UID SECONDS
-  odaud probe-capture UID SECONDS OUTPUT.wav
-
-STACKED is 0 or 1. Native delay values are experimental HAL compensation inputs,
-not yet verified playback delays. RELOAD_FILE contains one delay in milliseconds
-per output, separated by whitespace; SIGHUP applies it without recreating the device.
-The first output is the clock reference. No default output is changed.
-SIGINT/SIGTERM cleanly remove the probe device. Playback uses quiet synthetic chirps.";
+#[derive(Args)]
+struct NativeArgs {
+    /// Native stacked setting: 1 mirrored stereo, 0 separate channels on the tested OS
+    #[arg(value_parser = clap::value_parser!(u8).range(0..=1))]
+    stacked: u8,
+    #[arg(value_parser = seconds)]
+    seconds: f64,
+    /// File with whitespace-separated delay values for SIGHUP, or - to disable
+    #[arg(value_name = "RELOAD_FILE_OR_DASH")]
+    reload: PathBuf,
+    /// Physical output UID and delay in milliseconds, repeated for each output
+    #[arg(required = true, num_args = 2.., value_names = ["UID", "DELAY_MS"], allow_hyphen_values = true)]
+    outputs: Vec<String>,
+}
 
 fn main() {
+    let cli = Cli::parse();
     unsafe {
         for number in [1, 2, 15] {
             if signal(number, on_signal as *const () as usize) == usize::MAX {
@@ -59,7 +98,7 @@ fn main() {
             }
         }
     }
-    if let Err(error) = run(&std::env::args().skip(1).collect::<Vec<_>>()) {
+    if let Err(error) = run(cli.command) {
         eprintln!("odaud: {error}");
         std::process::exit(1);
     }
@@ -76,6 +115,14 @@ fn seconds(text: &str) -> Result<f64, String> {
     let value = text.parse::<f64>().map_err(|_| "invalid duration")?;
     if !value.is_finite() || !(0.1..=7200.0).contains(&value) {
         return Err("duration must be between 0.1 and 7200 seconds".into());
+    }
+    Ok(value)
+}
+
+fn capture_seconds(text: &str) -> Result<f64, String> {
+    let value = seconds(text)?;
+    if value > 60.0 {
+        return Err("diagnostic capture is limited to 60 seconds".into());
     }
     Ok(value)
 }
@@ -100,10 +147,9 @@ fn delays(text: &[&str], expected: usize) -> Result<Vec<f64>, String> {
         .collect()
 }
 
-fn run(args: &[String]) -> Result<(), String> {
-    match args.first().map(String::as_str) {
-        None | Some("--help" | "-h" | "help") => println!("{HELP}"),
-        Some("devices") if args.len() == 1 || (args.len() == 2 && args[1] == "--all") => {
+fn run(command: Command) -> Result<(), String> {
+    match command {
+        Command::Devices { all } => {
             let devices = hal::devices()?;
             if devices.is_empty() {
                 return Err(
@@ -112,7 +158,7 @@ fn run(args: &[String]) -> Result<(), String> {
             }
             for d in devices
                 .into_iter()
-                .filter(|device| args.len() == 2 || device.is_physical_output())
+                .filter(|device| all || device.is_physical_output())
             {
                 println!(
                     "{:?}\tuid={:?}\tid={}\toutputs={}\tinputs={}\trate={}",
@@ -125,11 +171,11 @@ fn run(args: &[String]) -> Result<(), String> {
                 }
             }
         }
-        Some("inspect") if args.len() == 2 => {
-            println!("{}", hal::inspect(find_device(&args[1])?.id)?);
+        Command::Inspect { uid } => {
+            println!("{}", hal::inspect(find_device(&uid)?.id)?);
         }
-        Some("check") if args.len() == 2 => {
-            let config = config::Config::load(Path::new(&args[1]))?;
+        Command::Check { config } => {
+            let config = config::Config::load(&config)?;
             let (selected, rate) = selected_outputs(&config)?;
             println!(
                 "valid: {:?}, {} outputs at {rate} Hz",
@@ -138,29 +184,25 @@ fn run(args: &[String]) -> Result<(), String> {
             );
             print_outputs(&config, rate);
         }
-        Some("run") if args.len() == 2 => configured(Path::new(&args[1]))?,
-        Some("cleanup") if args.len() == 2 => {
-            hal::cleanup_orphan(&args[1])?;
-            println!("removed orphan {:?}", args[1]);
+        Command::Run { config } => configured(&config)?,
+        Command::Cleanup { uid } => {
+            hal::cleanup_orphan(&uid)?;
+            println!("removed orphan {uid:?}");
         }
-        Some("probe-play") if args.len() == 3 => {
+        Command::ProbePlay { uid, seconds } => {
+            println!("{}", probe::play(find_device(&uid)?.id, seconds)?);
+        }
+        Command::ProbeCapture {
+            uid,
+            seconds,
+            output,
+        } => {
             println!(
                 "{}",
-                probe::play(find_device(&args[1])?.id, seconds(&args[2])?)?
+                probe::capture(find_device(&uid)?.id, seconds, &output)?
             );
         }
-        Some("probe-capture") if args.len() == 4 => {
-            println!(
-                "{}",
-                probe::capture(
-                    find_device(&args[1])?.id,
-                    seconds(&args[2])?,
-                    Path::new(&args[3])
-                )?
-            );
-        }
-        Some("probe-native") if args.len() >= 6 && args.len() % 2 == 0 => native(&args[1..])?,
-        _ => return Err(format!("invalid arguments\n\n{HELP}")),
+        Command::ProbeNative(args) => native(args)?,
     }
     Ok(())
 }
@@ -325,23 +367,24 @@ fn configured(path: &Path) -> Result<(), String> {
     result
 }
 
-fn native(args: &[String]) -> Result<(), String> {
-    let stacked = match args[0].as_str() {
-        "0" => false,
-        "1" => true,
-        _ => return Err("STACKED must be 0 or 1".into()),
-    };
-    let duration = seconds(&args[1])?;
-    let reload_path = &args[2];
-    let selected = args[3..]
-        .chunks_exact(2)
-        .map(|pair| find_device(&pair[0]))
-        .collect::<Result<Vec<_>, _>>()?;
-    let raw_delays = args[3..]
+fn native(args: NativeArgs) -> Result<(), String> {
+    if args.outputs.len() % 2 != 0 {
+        return Err("native outputs must be UID DELAY_MS pairs".into());
+    }
+    let stacked = args.stacked == 1;
+    let duration = args.seconds;
+    let reload_path = &args.reload;
+    let raw_delays = args
+        .outputs
         .chunks_exact(2)
         .map(|pair| pair[1].as_str())
         .collect::<Vec<_>>();
-    let requested = delays(&raw_delays, selected.len())?;
+    let requested = delays(&raw_delays, args.outputs.len() / 2)?;
+    let selected = args
+        .outputs
+        .chunks_exact(2)
+        .map(|pair| find_device(&pair[0]))
+        .collect::<Result<Vec<_>, _>>()?;
     let rate = selected[0].sample_rate;
     for (i, device) in selected.iter().enumerate() {
         if device.output_channels != 2 || device.uid.starts_with("com.github.Byron.odaud.") {
@@ -396,7 +439,7 @@ fn native(args: &[String]) -> Result<(), String> {
     while !STOP.load(Ordering::Relaxed) && start.elapsed().as_secs_f64() < duration {
         if RELOAD.swap(false, Ordering::Relaxed) {
             let update = (|| {
-                if reload_path == "-" {
+                if reload_path == Path::new("-") {
                     return Err("no reload file was supplied".into());
                 }
                 let contents = std::fs::read_to_string(reload_path).map_err(|e| e.to_string())?;
@@ -426,6 +469,85 @@ fn native(args: &[String]) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::CommandFactory;
+
+    #[test]
+    fn cli_has_generated_help_and_version() {
+        Cli::command().debug_assert();
+        for args in [vec!["odaud", "--help"], vec!["odaud", "run", "--help"]] {
+            assert_eq!(
+                Cli::try_parse_from(args).err().unwrap().kind(),
+                clap::error::ErrorKind::DisplayHelp
+            );
+        }
+        assert_eq!(
+            Cli::try_parse_from(["odaud", "--version"])
+                .err()
+                .unwrap()
+                .kind(),
+            clap::error::ErrorKind::DisplayVersion
+        );
+    }
+
+    #[test]
+    fn cli_rejects_invalid_arguments() {
+        for args in [
+            vec!["odaud", "run"],
+            vec!["odaud", "devices", "--typo"],
+            vec!["odaud", "check", "one.toml", "extra"],
+            vec!["odaud", "probe-capture", "mic", "61", "out.wav"],
+        ] {
+            assert!(Cli::try_parse_from(args).is_err());
+        }
+    }
+
+    #[test]
+    fn cli_preserves_native_probe_pairs_and_non_unicode_paths() {
+        use std::{ffi::OsString, os::unix::ffi::OsStringExt};
+        let Command::ProbeNative(args) = Cli::try_parse_from([
+            "odaud",
+            "probe-native",
+            "1",
+            "3",
+            "-",
+            "speaker",
+            "0",
+            "usb",
+            "50",
+        ])
+        .unwrap()
+        .command
+        else {
+            panic!("wrong command")
+        };
+        assert_eq!(args.outputs, ["speaker", "0", "usb", "50"]);
+        assert_eq!(args.reload, Path::new("-"));
+        let command = Cli::try_parse_from([
+            "odaud",
+            "probe-native",
+            "1",
+            "3",
+            "-",
+            "speaker",
+            "0",
+            "unpaired",
+        ])
+        .unwrap()
+        .command;
+        assert_eq!(
+            run(command).unwrap_err(),
+            "native outputs must be UID DELAY_MS pairs"
+        );
+        let path = OsString::from_vec(b"room-\xff.toml".to_vec());
+        let Command::Check { config } =
+            Cli::try_parse_from([OsString::from("odaud"), "check".into(), path.clone()])
+                .unwrap()
+                .command
+        else {
+            panic!("wrong command")
+        };
+        assert_eq!(config, PathBuf::from(path));
+    }
 
     #[test]
     fn native_offsets_round_frames_and_ignore_disabled_outputs() {

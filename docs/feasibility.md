@@ -133,7 +133,7 @@ Outstanding hardware validation:
 - Recheck visibility, stream composition, and cleanup on other macOS versions
   before claiming support for them.
 
-All 24 automated tests pass, along with Clippy with warnings denied and the
+All 27 automated tests pass, along with Clippy with warnings denied and the
 locked release build. Tests cover the implementation's own parsing, bounds,
 configuration transitions, control inputs, and diagnostic buffer handling.
 Compilation and those tests do not complete the outstanding hardware checks.

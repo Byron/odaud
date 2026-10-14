@@ -136,6 +136,7 @@ Core Audio's acoustic delay accuracy. Diagnostic source/capture commands are
 documented in [the feasibility record](docs/feasibility.md); they are test
 tools, not recording or process-capture features of normal routing.
 
-The audio path uses Apple's native frameworks through Rust FFI. Configuration
-uses Serde and TOML. [Dependency evidence](docs/dependencies.md) records every
+The audio path uses Apple's native frameworks through Rust FFI. Argument
+parsing uses Clap derives; configuration uses Serde and TOML.
+[Dependency evidence](docs/dependencies.md) records every
 locked version, license, maintenance check, and applicable security advisory.
